@@ -137,7 +137,10 @@ type internal DistributedFunctionPerformance(info: unit -> string) =
             sum / float num
 
 /// SingleRequestPerformance gives out the performance of a single query. 
-type internal SingleRequestPerformance() = 
+[<AllowNullLiteral>]
+type SingleRequestPerformance() = 
+    /// Ticks processing start
+    member val TickStart = DateTime.MinValue.Ticks with get, set
     /// Time spent in assignment stage, before the request is queued to network 
     member val InAssignment = 0 with get, set
     /// Time spent in network (including network stack)
@@ -152,7 +155,7 @@ type internal SingleRequestPerformance() =
     member val NumSlotsAvailable = 0 with get, set
     /// Additional Message
     member val Message : string = null with get, set
-    /// Serialize SingleQueryPerformance
+    /// Serialize 
     static member Pack( x:SingleRequestPerformance, ms:StreamBase<byte> ) = 
         let inQueue = if x.InQueue < 0 then 0 else if x.InQueue > 65535 then 65535 else x.InQueue
         let inProc = if x.InProcessing < 0 then 0 else if x.InProcessing > 65535 then 65535 else x.InProcessing
@@ -160,7 +163,7 @@ type internal SingleRequestPerformance() =
         ms.WriteUInt16( uint16 inProc )
         ms.WriteVInt32( x.NumItemsInQueue )
         ms.WriteVInt32( x.NumSlotsAvailable )
-    /// Deserialize SingleQueryPerformance
+    /// Deserialize 
     static member Unpack( ms:Stream ) = 
         let inQueue = int (ms.ReadUInt16())
         let inProcessing = int (ms.ReadUInt16())
@@ -404,7 +407,7 @@ type internal DistributedFunctionHolderBySemaphore(name:string, capacity:int, ex
     member x.DecRef() = Interlocked.Decrement( refCnt ) 
     /// Execute a distributed function with a certain time budget. 
     /// The execution is an observer object. 
-    member x.ExecuteWithTimebudget( jobID: Guid, timeBudget: int, input: Object, token: CancellationToken, observer:IObserver<Object>) = 
+    member x.ExecuteWithTimebudgetAndPerf( jobID: Guid, timeBudget: int, input: Object, perf: SingleRequestPerformance, token: CancellationToken, observer:IObserver<Object>) = 
         let noToken = ( token = Unchecked.defaultof<CancellationToken>)
         let isCancelled() = 
             cts.IsCancellationRequested ||
@@ -426,6 +429,8 @@ type internal DistributedFunctionHolderBySemaphore(name:string, capacity:int, ex
                 let semaTask = semaphore.WaitAsync(useTimeBudget, chainedToken )
                 let wrapperExecute (taskEnter:Task<bool>) = 
                     let elapse = int (( DateTime.UtcNow.Ticks - launchTicks ) / TimeSpan.TicksPerMillisecond )
+                    if Utils.IsNotNull perf then  
+                        perf.InQueue <- elapse 
                     if taskEnter.Result then 
                         // Entered
                         try 
@@ -485,6 +490,10 @@ type internal DistributedFunctionHolderBySemaphore(name:string, capacity:int, ex
                     if not noToken then 
                         chainedCTS.Dispose()
                     observer.OnError( ex )
+    /// Execute a distributed function with a certain time budget. 
+    /// The execution is an observer object. 
+    member x.ExecuteWithTimebudget( jobID: Guid, timeBudget: int, input: Object, token: CancellationToken, observer:IObserver<Object>) = 
+        x.ExecuteWithTimebudgetAndPerf( jobID, timeBudget, input, null, token, observer )
     override x.ToString() = sprintf "Distributed function %s:%s/%d" name (if Utils.IsNull semaphore then "Unknown" else (capacity-semaphore.CurrentCount).ToString() ) (capacity)
     /// Information on how many threads can enter semaphore, and the total capacity of the semaphore 
     member x.GetCount() = 
@@ -1571,6 +1580,10 @@ type internal DistributedFunctionHolderRef( holder: DistributedFunctionHolder) =
     /// The execution is an observer object. 
     member x.ExecuteWithTimebudget( jobID, timeBudget, input, token, observer ) = 
         holder.ExecuteWithTimebudget( jobID, timeBudget, input, token, observer )
+    /// Execute a distributed function with a certain time budget. 
+    /// The execution is an observer object. 
+    member x.ExecuteWithTimebudgetAndPerf( jobID, timeBudget, input, perf, token, observer ) = 
+        holder.ExecuteWithTimebudgetAndPerf( jobID, timeBudget, input, perf, token, observer )
     /// Cancel all jobs related to this distributed function. 
     member x.Cancel() = 
         holder.Cancel()
@@ -2453,6 +2466,7 @@ and DistributedFunctionStore internal () as thisStore =
                                 ()
                             // Try not to take queue in closure
                             let signature = queue.RemoteEndPointSignature
+                            let perf = SingleRequestPerformance( TickStart = DateTime.UtcNow.Ticks )
                             let observerToExecuteDistributedFunction = 
                                 {
                                     new IObserver<Object> with 
@@ -2509,7 +2523,7 @@ and DistributedFunctionStore internal () as thisStore =
                                 Logger.LogF( jobID, LogLevel.MildVerbose, fun _ -> sprintf "Rcvd Request, DistributedFunction of %A, %A, %A, %A from %s" providerID schemaIn domainID schemaOut 
                                                                                     (LocalDNS.GetShowInfo(queue.RemoteEndPoint))
                                                  )
-                                holder.ExecuteWithTimebudget( Guid.Empty, timeBudgetInMilliseconds, obj, Unchecked.defaultof<_>, observerToExecuteDistributedFunction )
+                                holder.ExecuteWithTimebudgetAndPerf( jobID, timeBudgetInMilliseconds, obj, perf, Unchecked.defaultof<_>, observerToExecuteDistributedFunction )
                         with 
                         | ex -> 
                             /// The particular request fails, but it doesn't affect other request from that queue
