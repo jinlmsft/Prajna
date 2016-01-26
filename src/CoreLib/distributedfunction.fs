@@ -581,20 +581,22 @@ type internal ServiceEndpointPerformance internal (slot) =
     static member val DefaultNumberOfPerformanceSlot = 32 with get, set
     member val internal QueryPerformanceCollection = Array.zeroCreate<_> slot with get, set
     /// Maximum number of request that can be served.
-    member val MaxSlots = 0 with get, set
+    member val internal MaxSlots = 0 with get, set
     /// Current number of request that is under service 
-    member val Curslots = 0 with get, set
+    member val internal Curslots = 0 with get, set
     /// Number of completed queries 
     member x.NumCompletedQuery with get() = (!completedReqRef)
     /// Total number of queries issued 
     member x.TotalQuery with get() = (!totalRequestRef)
     /// Number of queries to be serviced. 
     member x.OutstandingRequests with get() = (!outstandingRequestRef)
+    /// Default Expected Latency value before a reply is received 
+    static member val DefaultExpectedLatencyInMS = 100 with get, set
     /// <summary>
     /// If we send request to this Backend, the expected processing latency (in millisecond)
     /// It is calculated by avgNetworkRtt + avgProcessing + ( avgQueuePerSlot * itemsInQueue )
     /// </summary>
-    member val ExpectedLatencyInMS=100 with get, set
+    member val ExpectedLatencyInMS=ServiceEndpointPerformance.DefaultExpectedLatencyInMS with get, set
     /// <summary> 
     /// This function is called before each request is sent to backend for statistics 
     /// </summary>
