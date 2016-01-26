@@ -1,4 +1,4 @@
-(*---------------------------------------------------------------------------
+﻿(*---------------------------------------------------------------------------
     Copyright 2015 Microsoft
 
     Licensed under the Apache License, Version 2.0 (the "License");
@@ -140,7 +140,7 @@ type internal DistributedFunctionPerformance(info: unit -> string) =
 [<AllowNullLiteral>]
 type SingleRequestPerformance() = 
     /// Ticks processing start
-    member val TickStart = DateTime.MinValue.Ticks with get, set
+    member val private TickStart = DateTime.UtcNow.Ticks with get, set
     /// Time spent in assignment stage, before the request is queued to network 
     member val InAssignment = 0 with get, set
     /// Time spent in network (including network stack)
@@ -150,35 +150,47 @@ type SingleRequestPerformance() =
     /// Time spent in processing 
     member val InProcessing = 0 with get, set
     /// Number of Pending request in queue
-    member val NumItemsInQueue = 0 with get, set
+    member val Capacity = 0 with get, set
     /// Number of Slots Available
     member val NumSlotsAvailable = 0 with get, set
     /// Additional Message
     member val Message : string = null with get, set
+    /// Milliseconds since this structure is created. 
+    member x.Elapse with get() = int (( DateTime.UtcNow.Ticks - x.TickStart ) / TimeSpan.TicksPerMillisecond)
     /// Serialize 
-    static member Pack( x:SingleRequestPerformance, ms:StreamBase<byte> ) = 
+    static member Pack( x:SingleRequestPerformance, ms:Stream ) = 
         let inQueue = if x.InQueue < 0 then 0 else if x.InQueue > 65535 then 65535 else x.InQueue
         let inProc = if x.InProcessing < 0 then 0 else if x.InProcessing > 65535 then 65535 else x.InProcessing
         ms.WriteUInt16( uint16 inQueue )
         ms.WriteUInt16( uint16 inProc )
-        ms.WriteVInt32( x.NumItemsInQueue )
+        ms.WriteVInt32( x.Capacity )
         ms.WriteVInt32( x.NumSlotsAvailable )
     /// Deserialize 
     static member Unpack( ms:Stream ) = 
         let inQueue = int (ms.ReadUInt16())
         let inProcessing = int (ms.ReadUInt16())
-        let numItems = ms.ReadVInt32()
+        let capacity = ms.ReadVInt32()
         let numSlots = ms.ReadVInt32()
         SingleRequestPerformance( InQueue = inQueue, InProcessing = inProcessing, 
-                                    NumItemsInQueue = numItems, NumSlotsAvailable=numSlots )
+                                    Capacity = capacity, NumSlotsAvailable=numSlots )
     /// Show string that can be used to monitor backend performance 
     abstract BackEndInfo: unit -> string
     override x.BackEndInfo() = 
-        sprintf "queue: %dms, proc: %dms, items: %d, slot: %d" x.InQueue x.InProcessing x.NumItemsInQueue x.NumSlotsAvailable
+        sprintf "queue: %dms, proc: %dms, slot: %d/%d" x.InQueue x.InProcessing x.NumSlotsAvailable x.Capacity
     /// Show string that can be used to monitor frontend performance 
     abstract FrontEndInfo: unit -> string
     override x.FrontEndInfo() = 
-        sprintf "assign: %dms, network %dms, queue: %dms, proc: %dms, items: %d, slot: %d" x.InAssignment x.InNetwork x.InQueue x.InProcessing x.NumItemsInQueue x.NumSlotsAvailable
+        sprintf "assign: %dms, network %dms, queue: %dms, proc: %dms, slot: %d/%d" x.InAssignment x.InNetwork x.InQueue x.InProcessing x.NumSlotsAvailable x.Capacity
+    member x.CalculateNetworkPerformance( perfLocal: SingleRequestPerformance ) = 
+        x.TickStart <- perfLocal.TickStart
+        x.InAssignment <- perfLocal.InAssignment
+        let elapse = x.Elapse
+        let inNetwork = elapse - x.InAssignment - x.InProcessing - x.InQueue
+        if inNetwork < 0 then 
+            Logger.LogF( LogLevel.MildVerbose, fun _ -> sprintf "Calculated in network is %d ms (negative): elapse = %d ms, assignment = %d ms, queue = %d ms, process = %d ms"
+                                                                inNetwork elapse x.InAssignment x.InQueue x.InProcessing ) 
+        x.InNetwork <- Math.Min( 0, inNetwork )
+        ()
 
 /// Helper class to generate schema ID
 type internal SchemaJSonHelper<'T>() = 
@@ -496,11 +508,15 @@ type internal DistributedFunctionHolderBySemaphore(name:string, capacity:int, ex
         x.ExecuteWithTimebudgetAndPerf( jobID, timeBudget, input, null, token, observer )
     override x.ToString() = sprintf "Distributed function %s:%s/%d" name (if Utils.IsNull semaphore then "Unknown" else (capacity-semaphore.CurrentCount).ToString() ) (capacity)
     /// Information on how many threads can enter semaphore, and the total capacity of the semaphore 
+    /// Return 0, 0 if no capacity control is enforced. 
     member x.GetCount() = 
         if capacityControl then 
-            semaphore.CurrentCount, capacity 
+            if Volatile.Read( ctsStatus ) = 0 then
+                semaphore.CurrentCount, capacity 
+            else
+                0, capacity
         else
-            0, Int32.MaxValue
+            0, 0
     /// Cancel all jobs related to this distributed function. 
     /// ctsStatus will be 1 or higher after Cancel is called. 
     member x.Cancel() = 
@@ -530,6 +546,7 @@ type internal DistributedFunctionHolderBySemaphore(name:string, capacity:int, ex
                 // 2) The current thread succeed in the Exchange, and execute the dispose operation 
                 Logger.LogF ( LogLevel.MildVerbose, fun _ -> sprintf "%A is disposed" x)
                 cts.Dispose() 
+                semaphore.Dispose() 
         else
             // When not in capacity control, there is no lock. 
             // However, we may not be able to dispose CancellationTokenSource as there may still be job executing, and need to 
@@ -546,53 +563,7 @@ type internal DistributedFunctionHolderBySemaphore(name:string, capacity:int, ex
 
 type internal DistributedFunctionHolder = DistributedFunctionHolderBySemaphore
 
-// Previous name: SingleQueryPerformance gives out the performance of a single query. 
-
-/// <summary>
-/// SingleRemoteExecutionPerformance perfs the execution time of a single remote execution
-/// </summary>
-[<AllowNullLiteral; Serializable>]
-type SingleRemoteExecutionPerformance() = 
-    /// Time spent in assignment stage, before the request is sent to network 
-    // member val InAssignment = 0 with get, set
-    /// Time spent in network (including network stack)
-    member val InNetwork = 0 with get, set
-    /// Time spent in queue of the remote engine 
-    member val InQueue = 0 with get, set
-    /// Time spent in processing 
-    member val InProcessing = 0 with get, set
-    /// Number of Pending request in queue
-    member val NumItemsInQueue = 0 with get, set
-    /// Number of Slots Available
-    member val NumSlotsAvailable = 0 with get, set
-
-    /// Additional Message
-    member val Message : string = null with get, set
-    /// Serialize SingleRemoteExecutionPerformance
-    static member Pack( x:SingleRemoteExecutionPerformance, ms:Stream ) = 
-        let inQueue = if x.InQueue < 0 then 0 else if x.InQueue > 65535 then 65535 else x.InQueue
-        let inProc = if x.InProcessing < 0 then 0 else if x.InProcessing > 65535 then 65535 else x.InProcessing
-        ms.WriteUInt16( uint16 inQueue )
-        ms.WriteUInt16( uint16 inProc )
-        ms.WriteVInt32( x.NumItemsInQueue )
-        ms.WriteVInt32( x.NumSlotsAvailable )
-    /// Deserialize SingleRemoteExecutionPerformance
-    static member Unpack( ms:Stream ) = 
-        let inQueue = int (ms.ReadUInt16())
-        let inProcessing = int (ms.ReadUInt16())
-        let numItems = ms.ReadVInt32()
-        let numSlots = ms.ReadVInt32()
-        SingleRemoteExecutionPerformance( InQueue = inQueue, InProcessing = inProcessing, 
-                                NumItemsInQueue = numItems, NumSlotsAvailable=numSlots )
-    /// Show string that can be used to monitor backend performance 
-    abstract ServiceEndpointInfo: unit -> string
-    override x.ServiceEndpointInfo() = 
-        sprintf "queue: %dms, proc: %dms, items: %d, slot: %d" x.InQueue x.InProcessing x.NumItemsInQueue x.NumSlotsAvailable
-    /// Show string that can be used to monitor frontend performance 
-    abstract ClientInfo: unit -> string
-    override x.ClientInfo() = 
-        sprintf "network %dms, queue: %dms, proc: %dms, items: %d, slot: %d" x.InNetwork x.InQueue x.InProcessing x.NumItemsInQueue x.NumSlotsAvailable
-        
+       
 /// <summary> 
 /// Service endpoint performance tracking, if the programer intend to track more statistics, additional
 /// information may be included. 
@@ -644,7 +615,7 @@ type internal ServiceEndpointPerformance internal (slot) =
     /// This function is called whenever a reply is received. For error/timeout, put a non-empty message in perfQ.Message, and call this function. 
     /// If perQ.Message is not null, the execution fails. 
     /// </summary> 
-    abstract DepositReply: SingleRemoteExecutionPerformance -> unit
+    abstract DepositReply: SingleRequestPerformance -> unit
     default x.DepositReply( perfQ ) = 
         Interlocked.Increment( totalRequestRef ) |> ignore
         Interlocked.Decrement( outstandingRequestRef ) |> ignore
@@ -656,21 +627,21 @@ type internal ServiceEndpointPerformance internal (slot) =
             let mutable sumNetwork = 0
             let mutable sumQueue = 0 
             let mutable sumProcessing = 0 
-            let mutable sumQueueSlots = 0 
+            let slotsAvailable = perfQ.NumSlotsAvailable
+            let mutable sumQueueSlots = 0
             let maxItems = int (Math.Min( items, x.QueryPerformanceCollection.LongLength ) )
             for i = 0 to maxItems - 1 do 
                 let pQ = x.QueryPerformanceCollection.[i]
                 sumNetwork <- sumNetwork + pQ.InNetwork
                 sumQueue <- sumQueue + pQ.InQueue
                 sumProcessing <- sumProcessing + pQ.InProcessing
-                sumQueueSlots <- sumQueueSlots + Math.Min( 0, pQ.NumItemsInQueue - pQ.NumSlotsAvailable ) 
+                sumQueueSlots <- sumQueueSlots + ( pQ.Capacity - pQ.NumSlotsAvailable )
             avgNetworkRtt <- sumNetwork / maxItems
             avgProcessing <- sumProcessing / maxItems
             avgQueuePerSlot <- sumQueue / Math.Max( sumQueueSlots, 1) // Queue is usually proportional to the # of items in queue. 
-            x.MaxSlots <- Math.Max( x.MaxSlots, perfQ.NumSlotsAvailable ) 
-            x.Curslots <- perfQ.NumSlotsAvailable - perfQ.NumItemsInQueue - !outstandingRequestRef 
-            slotsOnBackend <- Math.Min( 0, perfQ.NumItemsInQueue - perfQ.NumSlotsAvailable ) 
-            x.ExpectedLatencyInMS <- avgNetworkRtt + avgProcessing + avgQueuePerSlot * ( slotsOnBackend + Math.Min( !outstandingRequestRef, 0) )
+            x.MaxSlots <- perfQ.Capacity
+            x.Curslots <- Math.Min( 0, perfQ.NumSlotsAvailable - !outstandingRequestRef ) 
+            x.ExpectedLatencyInMS <- avgNetworkRtt + avgProcessing + avgQueuePerSlot * ( x.Curslots + Math.Min( !outstandingRequestRef, 0) )
         else
             Interlocked.Increment( failedReqRef ) |> ignore 
     /// A functional variable used to construct ServiceEndpointPerformance
@@ -818,6 +789,8 @@ and internal OneRemoteDistributedFunctionRequest( serverInfoLocal: ContractServe
     let nCancelled = ref 0 
     let rgs = cts.Register( Action( thisInstance.CallbackForCancellation) )
     let mutable exInExecution : Exception = null 
+    let perfLocal = SingleRequestPerformance( )
+    member internal x.PerfLocal with get() = perfLocal
     member val ConnectedClients = ConcurrentDictionary<int64,int64*Guid*Guid*Guid*Guid*ServiceEndpointPerformance>() with get, set
     /// JobID 
     member val JobID = jobID with get
@@ -1048,6 +1021,7 @@ and internal OneRemoteDistributedFunctionRequest( serverInfoLocal: ContractServe
     /// Execute Distribution function
     member x.BaseExecuteDistributionPolicy() = 
         let signatures = x.BaseGetDistributionPolicySignatures() 
+        
         x.SendTo( signatures )
     /// Executed when the function receives a new object 
     member x.BaseFunctionOnNext( o: Object ) = 
@@ -1174,10 +1148,12 @@ and internal RemoteDistributedFunctionRequestStore private () =
             let oneRequest, _ = tuple 
             oneRequest.Failed( signature, ex )
     /// OnNext (when a reply has been received ) 
-    member x.OnNext( jobID, signature, o: Object ) = 
+    member x.OnNext( jobID, signature, o: Object, perfNetwork: SingleRequestPerformance ) = 
         let bExist, tuple = x.CollectionOfRemoteDistributedFunctionRequest.TryGetValue( jobID )
         if bExist then 
             let oneRequest, _ = tuple 
+            perfNetwork.CalculateNetworkPerformance( oneRequest.PerfLocal )
+            /// To perform the statistics
             oneRequest.OnRemoteReply( signature, o )
             Logger.LogF( jobID, LogLevel.MildVerbose, fun _ -> sprintf "RemoteDistributedFunctionRequestStore.OnNext, process remote reply ")
         else
@@ -1417,11 +1393,11 @@ and internal AggregationPolicyCollection private () =
     static member private Register( policyGuid:Guid, name, del:AggregationPolicyFunction ) = 
         aggregationPolicyCollection.Item( policyGuid ) <- ( name, del )
     /// Return the first object of the reply, and then signals that the operation is completed
-    static member private AggregationByFirstReply( req: OneRemoteDistributedFunctionRequest, signature, o:Object  ) = 
+    static member private AggregationByFirstReply( req: OneRemoteDistributedFunctionRequest, signature, o:Object) = 
         req.ReplyActionOnNext( o )
         true
     /// Return the an object of the reply, but continuous execution
-    static member private AggregationByAllReply( req: OneRemoteDistributedFunctionRequest, signature, o:Object  ) = 
+    static member private AggregationByAllReply( req: OneRemoteDistributedFunctionRequest, signature, o:Object) = 
         req.ReplyActionOnNext( o ) 
         false
     /// Find aggregation policy, if the request policy doesn't exist, the policy AggregationByFirstReplyGuid will be applied. 
@@ -1590,6 +1566,9 @@ type internal DistributedFunctionHolderRef( holder: DistributedFunctionHolder) =
     /// The execution is an observer object. 
     member x.ExecuteWithTimebudgetAndPerf( jobID, timeBudget, input, perf, token, observer ) = 
         holder.ExecuteWithTimebudgetAndPerf( jobID, timeBudget, input, perf, token, observer )
+    /// Get number of jobs that can be executed by the job holder and capacity
+    member x.GetCount() = 
+        holder.GetCount()
     /// Cancel all jobs related to this distributed function. 
     member x.Cancel() = 
         holder.Cancel()
@@ -2476,7 +2455,7 @@ and DistributedFunctionStore internal () as thisStore =
                                 ()
                             // Try not to take queue in closure
                             let signature = queue.RemoteEndPointSignature
-                            let perf = SingleRequestPerformance( TickStart = DateTime.UtcNow.Ticks )
+                            let perf = SingleRequestPerformance( )
                             let observerToExecuteDistributedFunction = 
                                 {
                                     new IObserver<Object> with 
@@ -2514,6 +2493,12 @@ and DistributedFunctionStore internal () as thisStore =
                                                     healthReply.WriteHeader( ms )
                                                     ms.WriteGuid( jobID )
                                                     ms.SerializeObjectWithSchema( o, schemaOut )
+                                                    let elapse = perf.Elapse
+                                                    perf.InProcessing <- Math.Min( 0, elapse - perf.InQueue)
+                                                    let curCount, capacity = holder.GetCount() 
+                                                    perf.Capacity <- capacity
+                                                    perf.NumSlotsAvailable <- curCount
+                                                    SingleRequestPerformance.Pack( perf, ms )
                                                     healthReply.WriteEndMark( ms )
                                                     Logger.LogF( jobID, LogLevel.MildVerbose, fun _ -> sprintf "Send Reply, DistributedFunction to %s" 
                                                                                                         (LocalDNS.GetShowInfo(queueReply.RemoteEndPoint))
@@ -2578,28 +2563,29 @@ and DistributedFunctionStore internal () as thisStore =
                 health.ReadHeader( ms )
                 let jobID = ms.ReadGuid()
                 let schemaOption = RemoteDistributedFunctionRequestStore.Current.TryGetRequestSchema( jobID, queue.RemoteEndPointSignature )
-                let replyObject, ex = 
+                let replyObject, ex, perfRemote = 
                     match schemaOption with 
                     | Some schema -> 
                         let o = ms.DeserializeObjectWithSchema( schema )
+                        let perf = SingleRequestPerformance.Unpack( ms )
                         let bValid = health.ReadEndMark( ms ) 
                         if not bValid then 
                             let msg = sprintf "Reply, DistributedFunction failed to properly process the EndMarker for payload %dB " ms.Length
                             let ex = System.ArgumentException( msg )
-                            o, ex
+                            o, ex, null
                         else
-                            o, null
+                            o, null, perf
                     | None -> 
                         let msg = sprintf "Reply, DistributedFunction failed to find schema for reply from %s of payload %dB " (LocalDNS.GetShowInfo( queue.RemoteEndPoint)) ms.Length
                         let ex = System.ArgumentException( msg )
-                        null, ex
+                        null, ex, null
                 if Utils.IsNotNull ex then 
                     RemoteDistributedFunctionRequestStore.Current.RequestException( jobID, queue.RemoteEndPointSignature, ex )
                 else
                     Logger.LogF( jobID, LogLevel.MildVerbose, fun _ -> sprintf "Rcvd Reply, DistributedFunction from %s" 
                                                                         (LocalDNS.GetShowInfo(queue.RemoteEndPoint))
                                         )
-                    RemoteDistributedFunctionRequestStore.Current.OnNext( jobID, queue.RemoteEndPointSignature, replyObject )
+                    RemoteDistributedFunctionRequestStore.Current.OnNext( jobID, queue.RemoteEndPointSignature, replyObject, perfRemote )
             with 
             | ex ->
                 ex.Data.Add( "@DoParseDistributedFunction(FailedRegister,DistributedFunction)", "exception at processing FailedReply function")
