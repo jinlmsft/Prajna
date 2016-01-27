@@ -181,15 +181,15 @@ type SingleRequestPerformance() =
     abstract FrontEndInfo: unit -> string
     override x.FrontEndInfo() = 
         sprintf "assign: %dms, network %dms, queue: %dms, proc: %dms, slot: %d/%d" x.InAssignment x.InNetwork x.InQueue x.InProcessing x.NumSlotsAvailable x.Capacity
-    member x.CalculateNetworkPerformance( perfLocal: SingleRequestPerformance ) = 
-        x.TickStart <- perfLocal.TickStart
+    member x.CalculateNetworkPerformance( perfLocal: SingleRequestPerformance, ticksSent ) = 
+        x.TickStart <- ticksSent
         x.InAssignment <- perfLocal.InAssignment
         let elapse = x.Elapse
-        let inNetwork = elapse - x.InAssignment - x.InProcessing - x.InQueue
+        let inNetwork = elapse - x.InProcessing - x.InQueue
         if inNetwork < 0 then 
             Logger.LogF( LogLevel.MildVerbose, fun _ -> sprintf "Calculated in network is %d ms (negative): elapse = %d ms, assignment = %d ms, queue = %d ms, process = %d ms"
                                                                 inNetwork elapse x.InAssignment x.InQueue x.InProcessing ) 
-        x.InNetwork <- Math.Min( 0, inNetwork )
+        x.InNetwork <- Math.Max( 0, inNetwork )
         ()
 
 /// Helper class to generate schema ID
@@ -568,12 +568,12 @@ type internal DistributedFunctionHolder = DistributedFunctionHolderBySemaphore
 /// Service endpoint performance tracking, if the programer intend to track more statistics, additional
 /// information may be included. 
 /// </summary>
-type internal ServiceEndpointPerformance internal (slot) = 
+type ServiceEndpointPerformance internal (slot) = 
     inherit NetworkPerformance() 
-    let totalRequestRef = ref 0L
-    let completedReqRef = ref 0L
-    let failedReqRef = ref 0L
-    let outstandingRequestRef = ref 0
+    let mutable totalRequest = 0L
+    let mutable completedReq = 0L
+    let mutable failedReq = 0L
+    let mutable outstandingRequest = 0
     let mutable avgNetworkRtt=300
     let mutable avgQueuePerSlot = 100
     let mutable avgProcessing = 1000 
@@ -585,11 +585,13 @@ type internal ServiceEndpointPerformance internal (slot) =
     /// Current number of request that is under service 
     member val internal Curslots = 0 with get, set
     /// Number of completed queries 
-    member x.NumCompletedQuery with get() = (!completedReqRef)
+    member x.NumCompletedQuery with get() = (completedReq)
+    /// Number of failed queries
+    member x.NumFailedQuery with get() = failedReq
     /// Total number of queries issued 
-    member x.TotalQuery with get() = (!totalRequestRef)
+    member x.TotalQuery with get() = totalRequest
     /// Number of queries to be serviced. 
-    member x.OutstandingRequests with get() = (!outstandingRequestRef)
+    member x.OutstandingRequests with get() = outstandingRequest
     /// Default Expected Latency value before a reply is received 
     static member val DefaultExpectedLatencyInMS = 100 with get, set
     /// <summary>
@@ -597,32 +599,41 @@ type internal ServiceEndpointPerformance internal (slot) =
     /// It is calculated by avgNetworkRtt + avgProcessing + ( avgQueuePerSlot * itemsInQueue )
     /// </summary>
     member val ExpectedLatencyInMS=ServiceEndpointPerformance.DefaultExpectedLatencyInMS with get, set
+
     /// <summary> 
     /// This function is called before each request is sent to backend for statistics 
     /// </summary>
-    abstract RegisterRequest: unit -> unit
-    default x.RegisterRequest() = 
-        Interlocked.Increment( outstandingRequestRef ) |> ignore
-        x.ExpectedLatencyInMS <- avgNetworkRtt + avgProcessing * ( slotsOnBackend + Math.Max( !outstandingRequestRef, 0) )
+    member internal x.RegisterRequest() = 
+        Interlocked.Increment( &totalRequest ) |> ignore
+        Interlocked.Increment( &outstandingRequest ) |> ignore
+        x.ExpectedLatencyInMS <- avgNetworkRtt + avgProcessing * ( slotsOnBackend + Math.Max( outstandingRequest, 0) )
+    /// This function is called when a request/reply arrives 
+    member private x.ReplyArrived() = 
+        let mutable cnt = Interlocked.Decrement( &outstandingRequest )
+        while cnt < 0 do
+            cnt <- Interlocked.Increment( &outstandingRequest )    
+    /// This function is called when a request fails. 
+    member internal x.FailedRequest( ) = 
+        x.ReplyArrived()
+        Interlocked.Increment( &failedReq ) |> ignore 
     /// Show the expected latency of the backend in string 
     member x.ExpectedLatencyInfo() = 
         sprintf "exp %dms=%d+%d*(%d+%d)"
                     x.ExpectedLatencyInMS
                     avgNetworkRtt avgProcessing 
-                    slotsOnBackend !outstandingRequestRef
+                    slotsOnBackend outstandingRequest
     /// Show the backend queue status in string 
     member x.QueueInfo() = 
-        sprintf "total: %d completed:%d, outstanding: %d, failed:%d" !totalRequestRef !completedReqRef !outstandingRequestRef (!failedReqRef)
+        sprintf "total: %d completed:%d, outstanding: %d, failed:%d" totalRequest completedReq outstandingRequest (failedReq)
     /// <summary> 
     /// This function is called whenever a reply is received. For error/timeout, put a non-empty message in perfQ.Message, and call this function. 
     /// If perQ.Message is not null, the execution fails. 
     /// </summary> 
-    abstract DepositReply: SingleRequestPerformance -> unit
-    default x.DepositReply( perfQ ) = 
-        Interlocked.Increment( totalRequestRef ) |> ignore
-        Interlocked.Decrement( outstandingRequestRef ) |> ignore
+    member internal x.DepositReply( perfQ:SingleRequestPerformance ) = 
+        x.ReplyArrived()
         if Utils.IsNull perfQ.Message then 
-            let items = Interlocked.Increment( completedReqRef ) 
+            let items = Interlocked.Increment( &completedReq ) 
+            /// ToDo: The following logic needs scrutization. 
             let idx = int (( items - 1L ) % int64 x.QueryPerformanceCollection.Length)
             x.QueryPerformanceCollection.[idx] <- perfQ
             // Calculate statistics of performance
@@ -642,10 +653,10 @@ type internal ServiceEndpointPerformance internal (slot) =
             avgProcessing <- sumProcessing / maxItems
             avgQueuePerSlot <- sumQueue / Math.Max( sumQueueSlots, 1) // Queue is usually proportional to the # of items in queue. 
             x.MaxSlots <- perfQ.Capacity
-            x.Curslots <- Math.Min( 0, perfQ.NumSlotsAvailable - !outstandingRequestRef ) 
-            x.ExpectedLatencyInMS <- avgNetworkRtt + avgProcessing + avgQueuePerSlot * ( x.Curslots + Math.Min( !outstandingRequestRef, 0) )
+            x.Curslots <- Math.Min( 0, perfQ.NumSlotsAvailable - outstandingRequest ) 
+            x.ExpectedLatencyInMS <- avgNetworkRtt + avgProcessing + avgQueuePerSlot * ( x.Curslots + Math.Min( outstandingRequest, 0) )
         else
-            Interlocked.Increment( failedReqRef ) |> ignore 
+            Interlocked.Increment( &failedReq ) |> ignore 
     /// A functional variable used to construct ServiceEndpointPerformance
     static member val ConstructFunc = fun _ -> ( new ServiceEndpointPerformance( ServiceEndpointPerformance.DefaultNumberOfPerformanceSlot ) ) with get, set
 
@@ -776,7 +787,8 @@ and internal CompletionPolicyFunction = Func<OneRemoteDistributedFunctionRequest
 
 
 /// This class encapsulate a single distributed function request. 
-and internal OneRemoteDistributedFunctionRequest( serverInfoLocal: ContractServerInfoLocal, 
+and internal OneRemoteDistributedFunctionRequest( stub: DistributedFunctionClientStub, 
+                                                    serverInfoLocal: ContractServerInfoLocal, 
                                                     name: string, 
                                                     jobID: Guid, 
                                                     timeoutInMilliseconds: int, 
@@ -812,8 +824,9 @@ and internal OneRemoteDistributedFunctionRequest( serverInfoLocal: ContractServe
     member val FailoverPolicy = failoverPolicyID with get, set
     /// Request object (input)
     member val ReqObjects = ConcurrentQueue<_>() with get
+    /// We will register an outstanding request if SentSignatureCollections contains the network signature 
     /// Objects are sent to these locations. 
-    member val SentSignatureCollections = ConcurrentDictionary<int64,bool>() with get
+    member val SentSignatureCollections = ConcurrentDictionary<int64,int64>() with get
     /// Objects are sent to these locations. 
     member val CompletedSignatureCollections = ConcurrentDictionary<int64,bool>() with get
     /// Timestamp that the request is received. 
@@ -845,17 +858,7 @@ and internal OneRemoteDistributedFunctionRequest( serverInfoLocal: ContractServe
     /// OneRemoteDistributedFunctionRequest
     member x.BaseFunctionOnStart() = 
         if Utils.IsNotNull x.InputSchemaCollection && Utils.IsNotNull x.OutputSchemaCollection then 
-            let dic = ConcurrentDictionary<int64,_>() 
-            for schemaIn in x.InputSchemaCollection do 
-                for schemaOut in x.OutputSchemaCollection do 
-                    let lst = RemoteDistributedFunctionProviderSignatureStore.TryDiscoverConnectedClients( x.ProviderID, x.DomainID, schemaIn, schemaOut )
-                    for tuple in lst do 
-                        let signature, _, _, _, _, _ = tuple
-                        if Utils.IsNull serverInfoLocal then
-                            dic.Item( signature ) <- tuple
-                        elif serverInfoLocal.ConnectedServerCollection.ContainsKey( signature ) then 
-                            dic.Item( signature ) <- tuple
-                                
+            let dic = stub.GetServiceEndPoints()
             x.ConnectedClients <- dic
             if x.ConnectedClients.IsEmpty then 
                 // Function can not be executed as there are no service endpoints. 
@@ -881,14 +884,17 @@ and internal OneRemoteDistributedFunctionRequest( serverInfoLocal: ContractServe
                     /// For Action or Function without parameter, please use null object as input 
                     for signature in signatures do 
                         let nNew = ref 0 
-                        let sentSignature = x.SentSignatureCollections.GetOrAdd( signature, fun _ -> nNew := 1
-                                                                                                     true )
+                        let ticksSent = x.SentSignatureCollections.GetOrAdd( signature, fun _ -> nNew := 1
+                                                                                                 DateTime.UtcNow.Ticks )
                         if !nNew = 1 then 
+                            /// Timing this request. 
                             // New signature 
                             let queue = NetworkConnections.Current.LookforConnectBySignature( signature )
                             let health = queue.Performance
                             let bExist, tuple = x.ConnectedClients.TryGetValue( signature )
                             let _, providerID, domainID, schemaIn, schemaOut, perf = tuple
+                            if bExist then 
+                                perf.RegisterRequest()
                             if bExist && Utils.IsNotNull queue && queue.CanSend then
                                 use ms = new MemStream()
                                 health.WriteHeader(ms)
@@ -918,6 +924,7 @@ and internal OneRemoteDistributedFunctionRequest( serverInfoLocal: ContractServe
                                                                                         ms.Length
                                                                                         (LocalDNS.GetShowInfo(queue.RemoteEndPoint))
                                                 )
+                                    /// Timing this request
                                     queue.ToSend( ControllerCommand( ControllerVerb.Request, ControllerNoun.DistributedFunction ), ms )
                                 else
                                     let msg = sprintf "Distributed function of %s, job %A times out after %d ms." name jobID elapse
@@ -933,24 +940,30 @@ and internal OneRemoteDistributedFunctionRequest( serverInfoLocal: ContractServe
         | ex -> 
             ex.Data.Add( "@FirstLocation", "___ OneRemoteDistributedFunctionRequest.SendTo __")
             x.Cancel( ex )
-           
+    /// Common processing of a failed endpoint
+    member x.FailedCommon( failedSignature:int64 ) = 
+        let bConnected, tuple = x.ConnectedClients.TryRemove( failedSignature )
+        let bSent, ticksSent = x.SentSignatureCollections.TryRemove( failedSignature )
+        if bSent && bConnected then 
+            /// If we have register a request (in SentSignatureCollections)
+            let _, providerID, domainID, schemaIn, schemaOut, perf = tuple
+            perf.FailedRequest()
+        bConnected, bSent
     /// A certain queue has failed 
     /// Need to trigger failover policy 
     member x.Failed(failedSignature:int64 ) = 
         // The reason to duplicate code from x.Failed( failedSignature, ex ) is so that 
         // if the request is not associated with the service endpoint that fails, very little operation is executed. 
-        x.ConnectedClients.TryRemove( failedSignature ) |> ignore 
-        let bFailed, _ = x.SentSignatureCollections.TryRemove( failedSignature )
-        if bFailed then 
-            let msg = sprintf "Socket %s disconnects" (LocalDNS.GetHostInfoInt64(failedSignature))
+        let bConnected, bSent = x.FailedCommon( failedSignature ) 
+        if bSent then 
+            let msg = sprintf "Socket %s fails to send a request" (LocalDNS.GetHostInfoInt64(failedSignature))
             let ex = System.Net.Sockets.SocketException( )
             ex.Data.Add( "FirstLocation", msg )
             x.ExecuteFailoverPollicy( failedSignature, ex )
     /// A certain service endpoint has failed with an exception. 
     member x.Failed(failedSignature:int64, ex: Exception ) = 
-        x.ConnectedClients.TryRemove( failedSignature ) |> ignore 
-        let bFailed, _ = x.SentSignatureCollections.TryRemove( failedSignature )
-        if bFailed then 
+        let bConnected, bSent = x.FailedCommon( failedSignature ) 
+        if bSent then 
             // We have find a certain service endpoint has failed. 
             x.ExecuteFailoverPollicy( failedSignature, ex )    
     /// Get reply schema
@@ -962,7 +975,14 @@ and internal OneRemoteDistributedFunctionRequest( serverInfoLocal: ContractServe
         else
             None
     /// On receiving a reply 
-    member x.OnRemoteReply( signature:int64, o: Object ) = 
+    member x.OnRemoteReply( signature:int64, o: Object, perfNetwork: SingleRequestPerformance ) = 
+        let bConnected, tuple = x.ConnectedClients.TryGetValue( signature )
+        let bSent, ticksSent = x.SentSignatureCollections.TryGetValue( signature )
+        if bConnected && bSent then 
+            /// When we have both, we can tried to time the performance 
+            let _, providerID, domainID, schemaIn, schemaOut, perfService = tuple
+            perfNetwork.CalculateNetworkPerformance( x.PerfLocal, ticksSent )
+            perfService.DepositReply( perfNetwork )
         let func : AggregationPolicyFunction = x.AggregationFuncLazy.Value
         let bDispose = func.Invoke( x, signature, o )
         if bDispose then 
@@ -1154,9 +1174,8 @@ and internal RemoteDistributedFunctionRequestStore private () =
         let bExist, tuple = x.CollectionOfRemoteDistributedFunctionRequest.TryGetValue( jobID )
         if bExist then 
             let oneRequest, _ = tuple 
-            perfNetwork.CalculateNetworkPerformance( oneRequest.PerfLocal )
             /// To perform the statistics
-            oneRequest.OnRemoteReply( signature, o )
+            oneRequest.OnRemoteReply( signature, o, perfNetwork )
             Logger.LogF( jobID, LogLevel.MildVerbose, fun _ -> sprintf "RemoteDistributedFunctionRequestStore.OnNext, process remote reply ")
         else
             Logger.LogF( jobID, LogLevel.MildVerbose, fun _ -> sprintf "RemoteDistributedFunctionRequestStore.OnNext, can't find the request in store, already removed? ")
@@ -1466,7 +1485,7 @@ and internal CompletionPolicyCollection private () =
 /// This class encapsulate a DistributedFunctionHolder for a remote function call. 
 /// The main reason of wrapping around DistributedFunctionHolder is capacity control (we can control 
 /// how many service call can be accepted per Distributed Function) 
-type internal DistributedFunctionClientStub(serverInfoLocal: ContractServerInfoLocal, 
+and internal DistributedFunctionClientStub(serverInfoLocal: ContractServerInfoLocal, 
                                             name:string, 
                                             providerID: Guid, 
                                             domainID: Guid, 
@@ -1508,7 +1527,8 @@ type internal DistributedFunctionClientStub(serverInfoLocal: ContractServerInfoL
     member x.ExecutorForClientStub( timeBudgetInMilliseconds: int, input: Object, token: CancellationToken, replyAction:IObserver<Object>) = 
         /// Generate a new job ID
         let jobID = Guid.NewGuid() 
-        let oneRequest = new OneRemoteDistributedFunctionRequest( serverInfoLocal, name, jobID, timeBudgetInMilliseconds, replyAction,
+        let oneRequest = new OneRemoteDistributedFunctionRequest( x, 
+                             serverInfoLocal, name, jobID, timeBudgetInMilliseconds, replyAction,
                              x.DistributionPolicy, 
                              x.AggregationPolicy, 
                              x.FailoverPolicy,
@@ -1550,6 +1570,26 @@ type internal DistributedFunctionClientStub(serverInfoLocal: ContractServerInfoL
                                         AggregationPolicyCollection.AggregationByAllReplyGuid, 
                                         FailoverPolicyCollection.FailoverRerunDistributionGuid, 
                                         CompletionPolicyCollection.CompletionByAllPeersGuid )
+    /// Get a list of service endpoints
+    member x.GetServiceEndPoints() = 
+        let dic = ConcurrentDictionary<int64,_>() 
+        for schemaIn in x.InputSchemaCollection do 
+            for schemaOut in x.OutputSchemaCollection do 
+                let lst = RemoteDistributedFunctionProviderSignatureStore.TryDiscoverConnectedClients( x.ProviderID, x.DomainID, schemaIn, schemaOut )
+                for tuple in lst do 
+                    let signature, _, _, _, _, _ = tuple
+                    if Utils.IsNull serverInfoLocal then
+                        dic.Item( signature ) <- tuple
+                    elif serverInfoLocal.ConnectedServerCollection.ContainsKey( signature ) then 
+                        dic.Item( signature ) <- tuple
+        dic
+    /// Get the performance of the service
+    member x.GetServicePerformance() = 
+        let dic = x.GetServiceEndPoints()
+        dic |> Seq.map( fun pair -> let signature = pair.Key 
+                                    let _, _, _, _, _, perf = pair.Value 
+                                    signature, perf ) 
+        |> Seq.toArray
 
 /// A DistributedFunctionHolder can be reference with multiple schema (e.g., different input/output coding type, etc..)
 /// DistributedFunctionHolderRef allows reference counting on the DistributedFunctionHolder. 
@@ -2772,6 +2812,13 @@ and DistributedFunctionStore internal () as thisStore =
     /// Try import an action to execution
     member x.TryImportUnitAction( name ) = 
         x.TryImportUnitAction( null, name )
+    /// Get performance of the unit action
+    member x.GetPerformanceUnitAction( serverInfo, name ) = 
+        let stub = x.TryFindUnitAction( serverInfo, name, x.DefaultImportProviderID, HashStringToGuid(name) )
+        stub.GetServicePerformance()
+    /// Get performance of the unit action
+    member x.GetPerformanceUnitAction( name ) = 
+        x.GetPerformanceUnitAction( null, name )
     /// <summary>
     /// Try find an action to execute without input and output parameter 
     /// Note that if there are multiple action with the same domain name, but with variation of the scema, the action will bind 
@@ -2813,6 +2860,13 @@ and DistributedFunctionStore internal () as thisStore =
     /// Try import an action to execution
     member x.TryImportAction<'T>( name ) =
         x.TryImportAction<'T>( null, name )
+    /// Get performance of imported action
+    member x.GetPerformanceAction<'T>( serverInfo, name ) =
+        let stub = x.TryFindAction<'T>( serverInfo, name, x.DefaultImportProviderID, HashStringToGuid(name) )
+        stub.GetServicePerformance()
+    /// Get performance of imported action
+    member x.GetPerformanceAction<'T>( name ) =
+        x.GetPerformanceAction<'T>( null, name )
     /// <summary>
     /// Try find function to execute with no input parameter, but with output. 
     /// <param name="name"> name of the distributed function (for debug purpose only) </param>
@@ -2861,6 +2915,13 @@ and DistributedFunctionStore internal () as thisStore =
     /// Try import an function with no input parameter
     member x.TryImportFunction<'TResult>( name ) =
         x.TryImportFunction<'TResult>( null, name ) 
+    /// Try import an function with no input parameter
+    member x.GetPerformanceFunction<'TResult>( serverInfo, name ) =
+        let stub = x.TryFindFunction<'TResult>( serverInfo, name, x.DefaultImportProviderID, HashStringToGuid(name) )
+        stub.GetServicePerformance()
+    /// Try import an function with no input parameter
+    member x.GetPerformanceFunction<'TResult>( name ) =
+        x.GetPerformanceFunction<'TResult>( null, name )
     /// <summary>
     /// Try find a function to execute
     /// <param name="name"> name of the distributed function (for debug purpose only) </param>
@@ -2908,6 +2969,10 @@ and DistributedFunctionStore internal () as thisStore =
     /// Try import a function to execution
     member x.TryImportFunction<'T,'TResult>( name ) =
         x.TryImportFunction<'T,'TResult>( null, name )
+    /// Try import a function to execution
+    member x.GetPerformanceFunction<'T,'TResult>( serverInfo, name ) =
+        let stub = x.TryFindFunction<'T, 'TResult>( serverInfo, name, x.DefaultImportProviderID, HashStringToGuid(name) )
+        stub.GetServicePerformance()
     /// <summary>
     /// Try find a function to execute
     /// <param name="name"> name of the distributed function (for debug purpose only) </param>
@@ -2986,6 +3051,14 @@ and DistributedFunctionStore internal () as thisStore =
     /// Try import a function to execution sequence 
     member x.TryImportSequenceFunction<'T,'TResult>( name ) =
         x.TryImportSequenceFunction<'T,'TResult>( null, name, -1 )
+    /// Get performance of a function to execution sequence 
+    member x.GetPerformanceSequenceFunction<'T,'TResult>( serverInfo, name ) =
+        let stub = x.TryFindSequenceFunction<'T, 'TResult>( serverInfo, name, x.DefaultImportProviderID, HashStringToGuid(name) )
+        stub.GetServicePerformance()
+    /// Get performance of a function to execution sequence 
+    member x.GetPerformanceSequenceFunction<'T,'TResult>( name ) =
+        x.GetPerformanceSequenceFunction<'T,'TResult>( null, name ) 
+
     /// <summary>
     /// Try find a function to execute
     /// <param name="name"> name of the distributed function (for debug purpose only) </param>
@@ -3055,7 +3128,13 @@ and DistributedFunctionStore internal () as thisStore =
     /// Try import a function to execution sequence 
     member x.TryImportSequenceFunction<'TResult>( name ) =
         x.TryImportSequenceFunction<'TResult>( null, name, -1 )
-
+    /// Get performance of a function to execution sequence 
+    member x.GetPerformanceSequenceFunction<'TResult>( serverInfo, name ) =
+        let stub = x.TryFindSequenceFunction<'TResult>( serverInfo, name, x.DefaultImportProviderID, HashStringToGuid(name) )
+        stub.GetServicePerformance()
+    /// Get performance of a function to execution sequence 
+    member x.GetPerformanceSequenceFunction<'TResult>( name ) =
+        x.GetPerformanceSequenceFunction<'TResult>( null, name )
 
 /// Distributed function store with Async interface. 
 type DistributedFunctionStoreAsync private( store:DistributedFunctionStore) =
@@ -3382,8 +3461,17 @@ type DistributedFunctionStoreAsync private( store:DistributedFunctionStore) =
             stub.ExecutorForClientStub( Timeout.Infinite, null, cts.Token, observer )
             ts.Task :> Task
         wrappedAction
+    /// Try import an action to execute
     member x.TryImportUnitAction( name ) = 
         x.TryImportUnitAction( null, name ) 
+    /// Get performance of an action to execution
+    member x.GetPerformanceUnitAction( serverInfo, name ) = 
+        let stub = store.TryFindUnitAction( serverInfo, name, store.DefaultImportProviderID, HashStringToGuid(name) )
+        stub.GetServicePerformance() 
+    /// Get performance of an action to execution
+    member x.GetPerformanceUnitAction( name ) = 
+        x.GetPerformanceUnitAction( null, name )
+
     /// Try import an action to execution
     member x.TryImportAction<'T>( serverInfo, name ) =
         let stub = store.TryFindAction<'T>( serverInfo, name, store.DefaultImportProviderID, HashStringToGuid(name) )
@@ -3411,6 +3499,13 @@ type DistributedFunctionStoreAsync private( store:DistributedFunctionStore) =
     /// Try import an action to execution
     member x.TryImportAction<'T>( name ) =
         x.TryImportAction<'T>( name )
+    /// Get performance of an action to execution
+    member x.GetPerformanceAction<'T>( serverInfo, name ) =
+        let stub = store.TryFindAction<'T>( serverInfo, name, store.DefaultImportProviderID, HashStringToGuid(name) )
+        stub.GetServicePerformance() 
+    /// Get performance of an action to execution
+    member x.GetPerformanceAction<'T>( name ) =
+        x.GetPerformanceAction<'T>( null, name )
     /// Try import a function to execution
     member x.TryImportFunction<'TResult>( serverInfo, name ) =
         let stub = store.TryFindFunction<'TResult>( serverInfo, name, store.DefaultImportProviderID, HashStringToGuid(name) )
@@ -3450,7 +3545,14 @@ type DistributedFunctionStoreAsync private( store:DistributedFunctionStore) =
     /// Try import a function to execution
     member x.TryImportFunction<'TResult>( name ) =
         x.TryImportFunction<'TResult>( null, name ) 
-    /// Try import an action to execution
+    /// Get performance of a function to execution
+    member x.GetPerformanceFunction<'TResult>( serverInfo, name ) =
+        let stub = store.TryFindFunction<'TResult>( serverInfo, name, store.DefaultImportProviderID, HashStringToGuid(name) )
+        stub.GetServicePerformance() 
+    /// Get performance of a function to execution
+    member x.GetPerformanceFunction<'TResult>( name ) =
+        x.GetPerformanceFunction<'TResult>( null, name ) 
+    /// Try import a function to execution
     member x.TryImportFunction<'T,'TResult>( serverInfo, name ) =
         let stub = store.TryFindFunction<'T, 'TResult>( serverInfo, name, store.DefaultImportProviderID, HashStringToGuid(name) )
         let wrappedFunction(param:'T) = 
@@ -3486,9 +3588,17 @@ type DistributedFunctionStoreAsync private( store:DistributedFunctionStore) =
             stub.ExecutorForClientStub( Timeout.Infinite, param, cts.Token, observer )
             ts.Task
         wrappedFunction
-    /// Try import an action to execution
+    /// Try import a function to execution
     member x.TryImportFunction<'T,'TResult>( name ) =
         x.TryImportFunction<'T,'TResult>( null, name ) 
+    /// Get performance of a function to execution
+    member x.GetPerformanceFunction<'T,'TResult>( serverInfo, name ) =
+        let stub = store.TryFindFunction<'T, 'TResult>( serverInfo, name, store.DefaultImportProviderID, HashStringToGuid(name) )
+        stub.GetServicePerformance() 
+    /// Get performance of a function to execution
+    member x.GetPerformanceFunction<'T,'TResult>( name ) =
+        x.GetPerformanceFunction<'T,'TResult>( null, name )
+
 /// This class services the request of distributed function. 
 type internal DistributedFunctionServices() =
     let lastStatisticsQueueCleanRef = ref DateTime.UtcNow.Ticks
