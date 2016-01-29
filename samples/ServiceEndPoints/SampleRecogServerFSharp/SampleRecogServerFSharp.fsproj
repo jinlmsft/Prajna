@@ -31,9 +31,14 @@
     <None Include="App.config" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\src\ServiceLib\ServiceEndPoint\ServiceEndPoint.fsproj">
-      <Name>ServiceEndPoint</Name>
-      <Project>{e0f55f39-44ea-4f56-b53c-df335f798c88}</Project>
+    <ProjectReference Include="..\..\..\src\CoreLib\CoreLib.fsproj">
+      <Name>CoreLib</Name>
+      <Project>{b4a6b9fa-a35b-4adb-ac15-6cca66225921}</Project>
+      <Private>True</Private>
+    </ProjectReference>
+    <ProjectReference Include="..\..\..\src\tools\tools\Tools.fsproj">
+      <Name>Tools (src\Tools\Tools)</Name>
+      <Project>{159bb552-8346-4313-8e10-43b88beca63b}</Project>
       <Private>True</Private>
     </ProjectReference>
   </ItemGroup>
@@ -87,16 +92,6 @@
   <Choose>
     <When Condition="$(TargetFrameworkIdentifier) == '.NETFramework' And ($(TargetFrameworkVersion) == 'v4.5' Or $(TargetFrameworkVersion) == 'v4.5.1' Or $(TargetFrameworkVersion) == 'v4.5.2' Or $(TargetFrameworkVersion) == 'v4.5.3' Or $(TargetFrameworkVersion) == 'v4.6')">
       <ItemGroup>
-        <Reference Include="Prajna.Tools">
-          <HintPath>..\..\packages\Prajna\lib\net45\Prajna.Tools.dll</HintPath>
-          <Private>True</Private>
-          <Paket>True</Paket>
-        </Reference>
-        <Reference Include="Prajna">
-          <HintPath>..\..\packages\Prajna\lib\net45\Prajna.dll</HintPath>
-          <Private>True</Private>
-          <Paket>True</Paket>
-        </Reference>
         <Reference Include="System.Configuration">
           <Paket>True</Paket>
         </Reference>
@@ -118,26 +113,6 @@
   <Choose>
     <When Condition="$(TargetFrameworkIdentifier) == '.NETFramework' And ($(TargetFrameworkVersion) == 'v4.5' Or $(TargetFrameworkVersion) == 'v4.5.1' Or $(TargetFrameworkVersion) == 'v4.5.2' Or $(TargetFrameworkVersion) == 'v4.5.3' Or $(TargetFrameworkVersion) == 'v4.6')">
       <ItemGroup>
-        <Reference Include="Prajna.BasicService">
-          <HintPath>..\..\packages\Prajna.Services\lib\net45\Prajna.BasicService.dll</HintPath>
-          <Private>True</Private>
-          <Paket>True</Paket>
-        </Reference>
-        <Reference Include="Prajna.BasicServiceData">
-          <HintPath>..\..\packages\Prajna.Services\lib\net45\Prajna.BasicServiceData.dll</HintPath>
-          <Private>True</Private>
-          <Paket>True</Paket>
-        </Reference>
-        <Reference Include="Prajna.Service.Gateway">
-          <HintPath>..\..\packages\Prajna.Services\lib\net45\Prajna.Service.Gateway.dll</HintPath>
-          <Private>True</Private>
-          <Paket>True</Paket>
-        </Reference>
-        <Reference Include="Prajna.Service.ServiceEndpoint">
-          <HintPath>..\..\packages\Prajna.Services\lib\net45\Prajna.Service.ServiceEndpoint.dll</HintPath>
-          <Private>True</Private>
-          <Paket>True</Paket>
-        </Reference>
         <Reference Include="System.Management">
           <Paket>True</Paket>
         </Reference>

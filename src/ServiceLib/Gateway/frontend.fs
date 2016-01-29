@@ -96,7 +96,7 @@ type OwnershipTracking() =
 
 /// Construct a performance statistics for a single query
 /// If customized performance tracking is required, please use this function to form a customized performance tracking class 
-type SinglePerformanceConstructFunction = Func<unit, SingleQueryPerformance>
+type SinglePerformanceConstructFunction = Func<unit, SingleRequestPerformance>
 
 type BackEndPerformance = ServiceEndpointPerformance
 
@@ -113,7 +113,7 @@ type OnInitialMsgToBackEndFunction = Func< StreamBase<byte>, seq<ServiceInstance
 // type AddServiceInstanceDelegate = delegate of int64*ServiceInstanceBasic -> unit
 // type OnDisconnectDelegate = delegate of int64 -> unit
 // type FrontEndParseDelegate = delegate of NetworkCommandQueuePeer * NetworkPerformance * ControllerCommand * ms: MemStream -> (bool * ManualResetEvent)
-// type OnReplyDelegate = delegate of (SingleQueryPerformance * Object )-> unit
+// type OnReplyDelegate = delegate of (SingleRequestPerformance * Object )-> unit
 
 
 
@@ -164,9 +164,9 @@ type RequestHolder() =
     /// </summary> 
     member val MaxReplyAllowed = 1 with get, set
     /// Trigger action downstream when sufficient number of replys are received from network 
-    member val private OnReplyExecutor = ExecuteEveryTrigger<SingleQueryPerformance * Object>(LogLevel.WildVerbose) with get
+    member val private OnReplyExecutor = ExecuteEveryTrigger<SingleRequestPerformance * Object>(LogLevel.WildVerbose) with get
     /// Trigger action downstream when sufficient number of replys are received from network 
-    member x.OnReply(action: Action<SingleQueryPerformance * Object>, infoFunc : unit -> string) =
+    member x.OnReply(action: Action<SingleRequestPerformance * Object>, infoFunc : unit -> string) =
         x.OnReplyExecutor.Add(action, infoFunc)
 
     /// Receive a reply from network
@@ -188,7 +188,7 @@ type DistributionPolicyFunction = Func<(RequestHolder * ( NetworkCommandQueue * 
 /// An aggregation policy aggregates reply received from client, and decide if a report should be sent to the client. 
 /// If Object is not null, the replyObject will be sent downstream. If the Object is null, the current object is suppressed. 
 /// </summary>
-type AggregationPolicyFunction = Func< (RequestHolder * SingleQueryPerformance * Object ), Object>
+type AggregationPolicyFunction = Func< (RequestHolder * SingleRequestPerformance * Object ), Object>
 /// <summary> 
 /// A parse function that interpret message at front end 
 /// </summary>
@@ -602,7 +602,7 @@ type FrontEndInstance< 'StartParamType
                     let buf = Array.zeroCreate<_> 16
                     ms.ReadBytes( buf ) |> ignore
                     let reqID = Guid( buf ) 
-                    let qPerf = SingleQueryPerformance.Unpack( ms ) 
+                    let qPerf = SingleRequestPerformance.Unpack( ms ) 
                     let replyObject = ms.DeserializeObjectWithTypeName()
                     if Utils.IsNull replyObject then 
                         Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "Reply, Request from %s received Null Object, Rtt = %f ms." (LocalDNS.GetShowInfo( queue.RemoteEndPoint )) (health.GetRtt()) ) )
@@ -849,7 +849,7 @@ type FrontEndInstance< 'StartParamType
                             let msg = sprintf "After distribution policy, the service collection %A has 0 availabe service" serviceID
                             Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "Req %A %s" 
                                                                                reqID msg ))
-                            let perfQ = SingleQueryPerformance( Message = msg )
+                            let perfQ = SingleRequestPerformance( Message = msg )
                             reqHolder.ReceivedReply( perfQ, null )
                             x.AddPerfStatistics( reqID, reqHolder, "NoService", null )
                             x.InProcessRequestCollection.TryRemove( reqID ) |> ignore
@@ -857,7 +857,7 @@ type FrontEndInstance< 'StartParamType
                             reqHolder.RequestAssignedFlag := 1
                         bRequestSend || bAnyOtherObject
                     else
-                        let perfQ = SingleQueryPerformance( Message = sprintf "Failed to find service collection %A" serviceID )
+                        let perfQ = SingleRequestPerformance( Message = sprintf "Failed to find service collection %A" serviceID )
                         Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "Req %A has an invalid service ID %A." 
                                                                            reqID serviceID ))
                         reqHolder.ReceivedReply( perfQ, null )
@@ -894,7 +894,7 @@ type FrontEndInstance< 'StartParamType
         // Timing 
         reqHolder.ReplyCollection.Item( queue.RemoteEndPointSignature) <- ref ( (PerfADateTime.UtcNowTicks()), 0L , null )
         true
-    member internal x.AddPerfStatistics( reqID, reqHolder, info, qPerf:SingleQueryPerformance ) = 
+    member internal x.AddPerfStatistics( reqID, reqHolder, info, qPerf:SingleRequestPerformance ) = 
         if x.StatisticsPeriodInSecond >= 0 then 
             x.StatisticsCollection.GetOrAdd( reqID, (reqHolder.TicksRequestReceived, reqHolder.ServiceID, info, qPerf ) ) |> ignore
             x.CleanStatisticsQueue() 
@@ -972,7 +972,7 @@ type FrontEndInstance< 'StartParamType
     /// This function can be used to implement policy that will wait for the return of 1st reply + num millisecond. Then a second AggregationPolicyFunction function is called to 
     /// resolve the reply object. 
     /// </summary> 
-    member internal x.AggregationByFirstReplyPlusN (msToWait:int) (secondAggregation) ( reqHolder, perfQ:SingleQueryPerformance, reqObject:Object )  = 
+    member internal x.AggregationByFirstReplyPlusN (msToWait:int) (secondAggregation) ( reqHolder, perfQ:SingleRequestPerformance, reqObject:Object )  = 
         let bAllIn, numReplyReceived, nMinReplyTicks = x.ReplyStatistics( reqHolder )
         if bAllIn then 
             secondAggregation( reqHolder, perfQ, reqObject )
@@ -1035,7 +1035,7 @@ type FrontEndInstance< 'StartParamType
             if bAllInOrTimeOut then 
                 if reqHolder.NumReplySent<=0 then 
                     let msg = sprintf "All %d reply come in, but there is no valid reply" reqHolder.ReplyCollection.Count
-                    let qPerf = SingleQueryPerformance( Message = msg ) 
+                    let qPerf = SingleRequestPerformance( Message = msg ) 
                     reqHolder.ReceivedReply( qPerf, null )
                     x.AddPerfStatistics( reqID, reqHolder, "Invalid", null )
                 Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "for request ID %s, all report coming in or timeout, request holder removed" (reqID.ToString()) )                    )
@@ -1057,7 +1057,7 @@ type FrontEndInstance< 'StartParamType
                 let ticksCur = (PerfADateTime.UtcNowTicks())
                 let ticksSent, _, _ = !refTuple
                 refTuple := ticksSent, ticksCur, null
-                let qPerf = SingleQueryPerformance( Message = msg )
+                let qPerf = SingleRequestPerformance( Message = msg )
                 qPerf.InAssignment <- int ( (ticksSent - reqHolder.TicksRequestReceived) / TimeSpan.TicksPerMillisecond )
                 qPerf.InNetwork <- int ( (ticksCur-ticksSent ) / TimeSpan.TicksPerMillisecond )
                 // Calculate performance statistics 
@@ -1089,7 +1089,7 @@ type FrontEndInstance< 'StartParamType
                 if bAllInOrTimeout then 
                     if reqHolder.NumReplySent<=0 then 
                         let msg = sprintf "Remote backend %s has been disconnected. " (LocalDNS.GetShowInfo(LocalDNS.Int64ToIPEndPoint(remoteSignature)))
-                        let qPerf = SingleQueryPerformance( Message = msg ) 
+                        let qPerf = SingleRequestPerformance( Message = msg ) 
                         x.PrepareReply( qPerf, reqID, reqHolder, null )                         
                     Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "queue %s shutdown, for request ID %s, no remaining outstanding report, request holder removed" (LocalDNS.GetShowInfo(LocalDNS.Int64ToIPEndPoint(remoteSignature))) (reqID.ToString()) )                    )
                     x.InProcessRequestCollection.TryRemove( reqID ) |> ignore 

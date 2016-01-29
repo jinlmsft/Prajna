@@ -42,6 +42,7 @@ open Prajna.Core
 open Prajna.Tools
 open Prajna.Tools.StringTools
 open Prajna.Tools.FSharp
+open Prajna.Service
 
 /// <summary> 
 /// Blob cache will be used by front-end and back-end to cache object for efficient service. 

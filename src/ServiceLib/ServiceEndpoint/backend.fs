@@ -42,7 +42,47 @@ open Prajna.Tools.StringTools
 open Prajna.Tools.FSharp
 open Prajna.Tools.Network
 
+open Prajna.Service
 open Prajna.Service.FSharp
+
+/// <summary>
+/// This class contains the parameter used to start a service endpoints. The class (and if you have derived from the class, any additional information) 
+/// will be serialized and send over the network to be executed on Prajna platform. Please fill in all class members that are not default. 
+/// </summary> 
+[<AllowNullLiteral; Serializable>]
+type ServiceEndPointParam() =
+    inherit WorkerRoleInstanceStartParam()
+    /// A collection of servers 
+    member val GatewayCollection = ContractServersInfo() with get
+    /// Time Interval to attempt to resolve frontend server
+    member val DNSResolveIntervalFrontEndInMS = 10000 with get, set
+    /// Timeout value (ms), request that are not served in this time interval will be throw away
+    /// If debugging, please set a large timeout value, or set TimeOutRequestInMilliSecond < 0 (infinity timeout), otherwise,
+    /// request may be dropped during debugging due to timeout. 
+    member val TimeOutRequestInMilliSecond = 30000 with get, set
+    /// Statistics period, calculate the request-reply performance statistics of recent X seconds. 
+    /// If StatisticsPeriodInSecond<=0, we don't keep statistics information. 
+    member val StatisticsPeriodInSecond = 600 with get, set
+    /// <summary> 
+    /// Add a Cluster (represented by clusterName) to the front end server collection. 
+    /// </summary>
+    member x.AddFrontEndCluster ( clusterName, port ) = 
+        x.GatewayCollection.AddSingleServer( clusterName, port ) 
+    /// <summary>
+    /// Add one server to the gateway collection. 
+    /// </summary> 
+    member x.AddOneServer ( serverName, port ) = 
+        x.GatewayCollection.AddSingleServer( serverName, port ) 
+    /// <summary>
+    /// Add one traffic manager to the front end server collection. see http://azure.microsoft.com/en-us/documentation/services/traffic-manager/ for 
+    /// traffic manager setup information. Repeated DNS resolve will be used to resolve the server collection behind the traffic manager, and the BackEnd will
+    /// attempt to connect to and serve all front end. 
+    /// </summary> 
+    member x.AddOneTrafficManager ( serverName, port ) = 
+        x.GatewayCollection.Add( FrontEndServer.TrafficManager( serverName, port ) )
+
+
+#if UNCOVER_DELETE
 
 /// <summary>
 /// Query execution mode, what are the possible execution 
@@ -214,45 +254,7 @@ type EncodeCollectionAction = Action<seq<ServiceInstanceBasic>*Stream>
 /// Action to deserialize the collection of service 
 type DecodeCollectionFunction = Func< Stream, seq<ServiceInstanceBasic> >
    
-/// <summary>
-/// This class contains the parameter used to start the back end service. The class (and if you have derived from the class, any additional information) 
-/// will be serialized and send over the network to be executed on Prajna platform. Please fill in all class members that are not default. 
-/// </summary> 
-[<AllowNullLiteral; Serializable>]
-type BackEndServiceParam() =
-    inherit WorkerRoleInstanceStartParam()
-    /// Time Interval to attempt to resolve frontend server
-    member val DNSResolveIntervalFrontEndInMS = 10000 with get, set
-    /// Timeout value (ms), request that are not served in this time interval will be throw away
-    /// If debugging, please set a large timeout value, or set TimeOutRequestInMilliSecond < 0 (infinity timeout), otherwise,
-    /// request may be dropped during debugging due to timeout. 
-    member val TimeOutRequestInMilliSecond = 30000 with get, set
-    /// Statistics period, calculate the request-reply performance statistics of recent X seconds. 
-    /// If StatisticsPeriodInSecond<=0, we don't keep statistics information. 
-    member val StatisticsPeriodInSecond = 600 with get, set
-    /// Front end collection represent a collection of Front End servers.
-    member val FrontEndCollection = List<FrontEndServer>() with get
-    /// <summary> 
-    /// Function to encode an array of service instances. 
-    /// </summary> 
-    member val EncodeServiceCollectionAction : EncodeCollectionAction = null with get, set
-    /// <summary> 
-    /// Add a Cluster (represented by clusterName) to the front end server collection. 
-    /// </summary>
-    member x.AddFrontEndCluster ( clusterName, port ) = 
-        x.FrontEndCollection.Add( FrontEndServer.Cluster( clusterName, port) ) 
-    /// <summary>
-    /// Add one server to the front end server collection. 
-    /// </summary> 
-    member x.AddOneServer ( serverName, port ) = 
-        x.FrontEndCollection.Add( FrontEndServer.Server( serverName, port ) )
-    /// <summary>
-    /// Add one traffic manager to the front end server collection. see http://azure.microsoft.com/en-us/documentation/services/traffic-manager/ for 
-    /// traffic manager setup information. Repeated DNS resolve will be used to resolve the server collection behind the traffic manager, and the BackEnd will
-    /// attempt to connect to and serve all front end. 
-    /// </summary> 
-    member x.AddOneTrafficManager ( serverName, port ) = 
-        x.FrontEndCollection.Add( FrontEndServer.TrafficManager( serverName, port ) )
+
 
 /// Function to excute when the backend starts 
 type BackEndOnStartFunction<'StartParamType> = Func< 'StartParamType, bool>
@@ -278,7 +280,7 @@ type BackEndParseFunction = Func< (NetworkCommandQueue * NetworkPerformance * Co
 /// </summary> 
 [<AllowNullLiteral; AbstractClass>]
 type BackEndInstance< 'StartParamType 
-                    when 'StartParamType :> BackEndServiceParam >() =
+                    when 'StartParamType :> ServiceEndPointParam >() =
     inherit WorkerRoleInstance<'StartParamType>()
     let mutable dnsResolveIntervalFrontEndInMS = 10000
     let lastStatisticsQueueCleanRef = ref (PerfADateTime.UtcNowTicks())
@@ -820,13 +822,13 @@ type BackEndInstance< 'StartParamType
         if bHealth && not (Utils.IsNull queue) then 
             let ticksCur = (PerfADateTime.UtcNowTicks())
             let timeInProcessingMS = int (( ticksCur - ticks ) / TimeSpan.TicksPerMillisecond)
-            let qPerf = SingleQueryPerformance( InQueue = timeInQueueMS, InProcessing = timeInProcessingMS, 
+            let qPerf = SingleRequestPerformance( InQueue = timeInQueueMS, InProcessing = timeInProcessingMS, 
                                                 NumSlotsAvailable = numSlotsAvailable, 
                                                 Capacity = capacity )
             use msReply = new MemStream( ) 
             health.WriteHeader( msReply )         
             msReply.WriteBytes( reqID.ToByteArray() ) 
-            SingleQueryPerformance.Pack( qPerf, msReply )
+            SingleRequestPerformance.Pack( qPerf, msReply )
             msReply.SerializeObjectWithTypeName( replyObject ) 
             health.WriteEndMark( msReply ) 
             Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "query %s has been served and returned with a reply of %dB (%s)" (reqID.ToString()) (msReply.Length) (qPerf.BackEndInfo()) ))
@@ -926,3 +928,4 @@ type BackEndQueryStatistics() =
                                                    sprintf "Reply %s: %d requests (%d ms, %d ms)" pair.Key cnt (sumInQueue/int64 cnt) (sumInProcessing/int64 cnt) ) )
 
                                                           
+#endif

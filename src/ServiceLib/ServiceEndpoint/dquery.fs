@@ -45,8 +45,7 @@ open Prajna.Tools
 open Prajna.Tools.StringTools
 open Prajna.Tools.FSharp
 
-type NetworkPerformance = Prajna.Core.NetworkPerformance
-
+#if UNCOVER_DELETE
 /// <summary>
 /// QueryPerformance provides a performance statistics instance for the underlying operation. 
 /// Whenever a request is queued, a timestamp is registered in the class. We will wait for the 
@@ -95,13 +94,6 @@ type QueryPerformance(info: unit -> string) =
             sum / float num
 
 /// <summary>
-/// SingleQueryPerformance gives out the performance of a single query. 
-/// </summary>
-type SingleQueryPerformance = Prajna.Service.SingleRequestPerformance
-
-
-
-/// <summary>
 /// QueryProviderQueue represents a connection to/from a recognition hub, and the associated performance information
 /// gateway. 
 /// </summary>
@@ -118,3 +110,4 @@ type internal QueryProviderQueue(info) =
     /// Performance of the endpoint. Each domain is a string, e.g., "DogBreed", "Plant". 
     /// </summary>
     member val QueryPerf = QueryPerformance(info) with get
+#endif

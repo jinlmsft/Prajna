@@ -127,7 +127,7 @@ type VHubServiceInstance() =
 /// </example>
 [<AllowNullLiteral>]
 type VHubBackendStartParam(  ) as x = 
-    inherit BackEndServiceParam()
+    inherit ServiceEndPointParam()
     do 
         x.EncodeServiceCollectionAction <- EncodeCollectionAction( VHubServiceInstance.EncodeCollections )
 /// <summary>
