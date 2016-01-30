@@ -64,22 +64,492 @@ type ServiceEndPointParam() =
     /// If StatisticsPeriodInSecond<=0, we don't keep statistics information. 
     member val StatisticsPeriodInSecond = 600 with get, set
     /// <summary> 
-    /// Add a Cluster (represented by clusterName) to the front end server collection. 
+    /// Add a Cluster to the gateway collection. 
     /// </summary>
-    member x.AddFrontEndCluster ( clusterName, port ) = 
-        x.GatewayCollection.AddSingleServer( clusterName, port ) 
+    member x.AddCluster ( cl ) = 
+        x.GatewayCollection.AddCluster( cl ) 
     /// <summary>
     /// Add one server to the gateway collection. 
     /// </summary> 
-    member x.AddOneServer ( serverName, port ) = 
+    member x.AddSingleServer ( serverName, port ) = 
         x.GatewayCollection.AddSingleServer( serverName, port ) 
     /// <summary>
     /// Add one traffic manager to the front end server collection. see http://azure.microsoft.com/en-us/documentation/services/traffic-manager/ for 
     /// traffic manager setup information. Repeated DNS resolve will be used to resolve the server collection behind the traffic manager, and the BackEnd will
     /// attempt to connect to and serve all front end. 
     /// </summary> 
-    member x.AddOneTrafficManager ( serverName, port ) = 
-        x.GatewayCollection.Add( FrontEndServer.TrafficManager( serverName, port ) )
+    member x.AddServerBehindTrafficManager ( serverName, port ) = 
+        x.GatewayCollection.AddServerBehindTrafficManager( serverName, port )
+
+type BackEndServiceParam = ServiceEndPointParam
+
+/// Function to excute when the service endpoint start starts 
+type ServiceEndPointOnStartFunction<'StartParamType> = Func< 'StartParamType, bool>
+
+type BackEndOnStartFunction<'StartParamType> = ServiceEndPointOnStartFunction<'StartParamType>
+
+/// <summary>
+/// This class represent a service endpoints. 
+/// The developer may need to extend ServiceEndpointInstance class, to implement the missing functions.
+/// The following command are reserved:
+///     List, Buffer : in the beginning, to list Guids that are used by the current backend instance. 
+///     Read, Buffer : request to send a list of missing Guids. 
+///     Write, Buffer: send a list of missing guids. 
+///     Echo, QueryReply : Keep alive, send by front end periodically
+///     EchoReturn, QueryReply: keep alive, send to front end periodically
+///     Set, QueryReply: Pack serviceInstance information. 
+///     Get, QueryReply: Unpack serviceInstance information 
+///     Request, QueryReply : FrontEnd send in a request (reqID, serviceID, payload )
+///     Reply, QueryReply : BackEnd send in a reply
+///     TimeOut, QueryReply : BackEnd is too heavily loaded, and is unable to serve the request. 
+///     NonExist, QueryReply : requested BackEnd service ID doesn't exist. 
+/// </summary> 
+[<AllowNullLiteral; AbstractClass>]
+type ServiceEndPointInstance< 'StartParamType 
+                    when 'StartParamType :> ServiceEndPointParam >() =
+    inherit WorkerRoleInstance<'StartParamType>()
+    let mutable localServerInfo = ContractServerInfoLocalRepeatable()
+    let mutable dnsResolveIntervalFrontEndInMS = 10000
+    let mutable lastStatisticsQueueClean = (DateTime.UtcNow.Ticks)
+    /// <summary> 
+    /// Timeout value, in ticks 
+    /// </summary>
+    member val internal TimeOutTicks = Int64.MaxValue with get, set
+    member val internal bTerminate = false with get, set
+    member val internal  InitialMessage = null with get, set
+    /// Programmer will need to extend ServiceEndPointInstance class to fill in OnStartBackEnd. The jobs of OnStartBackEnd are: 
+    /// 1. fill in ServiceCollection entries. Note that N parallel thread will be running the Run() operation. However, OnStartBackEnd are called only once.  
+    /// 2. fill in BufferCache.Current on CacheableBuffer (constant) that we will expect to store at the server side. 
+    /// 3. fill in MoreParseFunc, if you need to extend beyond standard message exchanged between BackEnd/FrontEnd
+    ///         Please make sure not to use reserved command (see list in the description of the class ServiceEndPointInstance )
+    ///         Network health and message integrity check will be enforced. So when you send a new message to the FrontEnd, please use:
+    ///             health.WriteHeader (ms)
+    ///             ... your own message ...
+    ///             health.WriteEndMark (ms )
+    /// 4. Setting TimeOutRequestInMilliSecond, if need
+    /// 5. Function in EncodeServiceCollectionAction will be called to pack all service collection into a stream to be sent to the front end. 
+    member val OnStartBackEnd = List< ServiceEndPointOnStartFunction<'StartParamType> >() with get
+    /// Constant string to export/import contract to retrieve Active FrontEnds
+    static member val ContractNameActiveFrontEnds = "ActiveFrontEnds" with get
+    /// Constant string to export/import contract of request statistics. 
+    static member val ContractNameRequestStatistics = "RequestStatistics" with get
+    override x.OnStart param =
+        // Put code to initialize gateway here. 
+        let mutable bSuccess = true 
+        for lst in x.OnStartBackEnd do
+            bSuccess <- bSuccess && lst.Invoke( param )     
+        x.bTerminate <- not bSuccess
+        if bSuccess then 
+            x.AddFrontEndEntries( param )
+            dnsResolveIntervalFrontEndInMS <- param.DNSResolveIntervalFrontEndInMS
+            x.StatisticsPeriodInSecond <- param.StatisticsPeriodInSecond
+            if param.TimeOutRequestInMilliSecond<=0 then 
+                x.TimeOutTicks <- Int64.MaxValue // no time out
+            else
+                x.TimeOutTicks <- int64 param.TimeOutRequestInMilliSecond * TimeSpan.TicksPerMillisecond
+            
+            let guids = BufferCache.Current.GetGuidCollections()
+            if guids.Length > 0 then 
+                let ms = new MemStream( 16 * guids.Length + 512 )
+                BufferCache.PackGuid( guids, ms ) 
+                initialMsg.Add( ControllerCommand( ControllerVerb.List, ControllerNoun.Buffer ), ms ) 
+            // Initialize service capacity
+            for pair in x.ServiceCollection do 
+                let serviceID = pair.Key
+                let serviceBags = pair.Value
+                let mutable totalCapacity = 0 
+                for item in serviceBags do 
+                    item.CurrentItems := 0 
+                    if item.MaxConcurrentItems <=0 then 
+                        item.MaxConcurrentItems <- 1
+                    if totalCapacity + item.MaxConcurrentItems < totalCapacity then 
+                        // We have an overflow 
+                        totalCapacity <- Int32.MaxValue
+                    else
+                        totalCapacity <- totalCapacity + item.MaxConcurrentItems
+                if totalCapacity > 0 then 
+                    x.ServiceCapacity.Item( serviceID) <- ServiceCapacity(totalCapacity) 
+                    x.SecondaryServiceQueue.Item( serviceID ) <- ConcurrentQueue<_>()
+                else
+                    Logger.LogF( LogLevel.Warning, ( fun _ -> sprintf "Service collection %A is removed as it has a capacity of <=0 " serviceID  ))
+                    x.ServiceCapacity.TryRemove( serviceID ) |> ignore 
+            let collections = x.ServiceCollection.Values |> Seq.collect ( Operators.id )
+            // Pack information on service 
+            let msCollection = new MemStream() 
+            param.EncodeServiceCollectionAction.Invoke( collections, msCollection :> Stream ) 
+            initialMsg.Add( ControllerCommand( ControllerVerb.Set, ControllerNoun.QueryReply ), msCollection ) 
+            x.InitialMessage <- initialMsg.ToArray()
+            // Export backend information
+            ContractStore.ExportSeqFunction( ServiceEndPointInstance<_>.ContractNameActiveFrontEnds, x.ListActiveFrontEnds, -1, true )
+            ContractStore.ExportSeqFunction( ServiceEndPointInstance<_>.ContractNameRequestStatistics, x.GetRequestStatistics, -1, true )
+
+        bSuccess 
+    /// An Entry of Front end, if the value is -1, the FrontEnd is resolved once to an addr/port, and being try to connect
+    /// If the value is 0, the FrontEnd will be resolved repeatedly, 
+    member val FrontEndNameEntry = ConcurrentDictionary<_,_>((StringTComparer<int>(StringComparer.OrdinalIgnoreCase))) with get, set
+    /// Whether the DNS Resolution thread is in running
+    member val internal refRunningDNSThread = ref 0 with get
+    /// Blocking DNS Resolution thread
+    member val internal EvBlockDNSThread = new ManualResetEvent(false) with get
+    /// Data collection of the health of all frontend nodes attached 
+    member val internal FrontEndHealth = ConcurrentDictionary<_, NetworkPerformance >() with get, set
+    member internal x.AddFrontEndEntries(param) = 
+        localServerInfo.Add( param.GatewayCollection )
+        localServerInfo.RepeatedDNSResolve( true )
+    override x.Run() = 
+        while not x.bTerminate do 
+            while not x.bTerminate && x.ExaminePrimaryQueueOnce() do 
+                // Continuously process Primary Queue items if there is something to do. 
+                ()
+            if not x.bTerminate then 
+                if x.FrontEndNameEntry.IsEmpty && x.FrontEndHealth.IsEmpty then 
+                    // If no gateway, terminates. 
+                    Logger.Log( LogLevel.MildVerbose, ("Terminate ServiceEndPointInstance as there is no FrontEnd name entry and no active connection"))
+                    x.bTerminate <- true
+                else
+                    x.EvPrimaryQueue.Reset() |> ignore 
+                    if x.PrimaryQueue.IsEmpty then 
+                        x.EvPrimaryQueue.WaitOne() |> ignore
+        x.EvTerminated.Set() |> ignore         
+    override x.OnStop() = 
+        // Cancel all pending jobs. 
+        x.CancelAllInstances()
+    override x.IsRunning() = 
+        not x.bTerminate
+    /// Cancel function, the thread receives a cancellation request, that should terminate all thread in this tasks
+    member internal x.CancelAllInstances() = 
+        x.bTerminate <- true
+        x.EvBlockDNSThread.Set() |> ignore
+        // Terminate all queues. 
+        for pair in x.FrontEndHealth do 
+            let remoteSignature = pair.Key
+            let queue = Cluster.Connects.LookforConnectBySignature( remoteSignature ) 
+            if not (Utils.IsNull queue ) then 
+                queue.Terminate()
+        x.EvPrimaryQueue.Set() |> ignore 
+    /// Parse Receiving command 
+    member internal x.ParseFrontEndRequest queue cmd ms = 
+        if not x.bTerminate then 
+            try
+                let remoteSignature = queue.RemoteEndPointSignature
+                let health = x.FrontEndHealth.GetOrAdd( remoteSignature, fun _ -> NetworkPerformance() )
+                health.ReadHeader( ms ) 
+                match cmd.Verb, cmd.Noun with 
+                | ControllerVerb.Unknown, _ -> 
+                    ()
+                | ControllerVerb.Read, ControllerNoun.Buffer -> 
+                    let guids = BufferCache.UnPackGuid( ms ) 
+                    let items = BufferCache.Current.FindCacheableBufferByGuid( guids ) 
+                    use msSend = new MemStream( )
+                    health.WriteHeader( msSend ) 
+                    BufferCache.PackCacheableBuffers( items, msSend )
+                    health.WriteEndMark( msSend ) 
+                    queue.ToSend( ControllerCommand(ControllerVerb.Write, ControllerNoun.Buffer ), msSend )
+                    ()
+                | ControllerVerb.Request, ControllerNoun.QueryReply -> 
+                    // x.ParseTimestamp( queue, health, ms )
+                    let buf = Array.zeroCreate<_> 16
+                    ms.ReadBytes( buf ) |> ignore
+                    let reqID = Guid( buf ) 
+                    ms.ReadBytes( buf ) |> ignore
+                    let serviceID = Guid( buf ) 
+                    Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "to parse request from %s req %A of service %A %dB, Rtt = %f ms." 
+                                                                           (LocalDNS.GetShowInfo( queue.RemoteEndPoint )) 
+                                                                           reqID serviceID
+                                                                           (ms.Length) (health.GetRtt()) ) )
+                    let requestObject = ms.DeserializeObjectWithTypeName()
+                    Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "from %s received request %A %dB, Rtt = %f ms." 
+                                                                           (LocalDNS.GetShowInfo( queue.RemoteEndPoint )) 
+                                                                           reqID
+                                                                           (ms.Length) (health.GetRtt()) ) )
+                    x.ProcessRequest( queue, health, reqID, serviceID, requestObject )
+                | ControllerVerb.Echo, ControllerNoun.QueryReply ->
+                    let t1 = (PerfDateTime.UtcNowTicks())
+                    use msSend = new MemStream( 128 )
+                    health.WriteHeader( msSend ) 
+                    health.WriteEndMark( msSend ) 
+                    queue.ToSend( ControllerCommand(ControllerVerb.EchoReturn, ControllerNoun.QueryReply ), msSend )
+                    Logger.LogF( LogLevel.WildVerbose, ( fun _ -> sprintf "from %s receive echo, Rtt = %.2f ms (last Rtt = %.2f ms ), process in %f ms" (LocalDNS.GetShowInfo( queue.RemoteEndPoint )) (health.GetRtt()) (health.LastRtt) 
+                                                                           (TimeSpan((PerfDateTime.UtcNowTicks()) - t1 ).TotalMilliseconds) ) )
+                | _ -> 
+                    let mutable bParsed = false 
+//                    let en = x.OnParse.GetEnumerator()
+//                    while not bParsed && en.MoveNext() do 
+//                        let del = en.Current
+                    for del in x.OnParse do 
+                        if not bParsed then 
+                            let bUse, ev = del.Invoke( queue, health, cmd, ms ) 
+                            if bUse then 
+                                bParsed <- bUse
+                                if not(Utils.IsNull ev) then 
+                                    // Blocked in parse
+                                    let mutable bDone = false
+                                    while not bDone do
+                                        let bUse, ev = del.Invoke( queue, health, cmd, ms ) 
+                                        bDone <- Utils.IsNull ev
+                    if not bParsed then 
+                        Logger.LogF( LogLevel.Info, ( fun _ -> sprintf "from gateway %s received a command %A (%dB) that is not parsed by the service " 
+                                                                   (LocalDNS.GetShowInfo( queue.RemoteEndPoint )) 
+                                                                   cmd ms.Length))
+                let bValid = health.ReadEndMark( ms ) 
+                if not bValid then 
+                    Logger.LogF( LogLevel.Info, ( fun _ -> sprintf "from gateway %s received an unrecognized command %A (%dB), the intergrity check fails " 
+                                                               (LocalDNS.GetShowInfo( queue.RemoteEndPoint )) 
+                                                               cmd ms.Length)                    )
+            with 
+            | e -> 
+                Logger.LogF( LogLevel.Error, ( fun _ -> sprintf "Exception in ParseFrontEndRequest, %A" e ))
+    /// Processing Request object
+    member internal x.ProcessRequest( queue, health, reqID, serviceID, requestObject ) =
+        let bExist, jobQueue = x.SecondaryServiceQueue.TryGetValue( serviceID ) 
+        if bExist then 
+            let remoteSignature = queue.RemoteEndPointSignature
+            jobQueue.Enqueue( reqID, requestObject, remoteSignature, (PerfADateTime.UtcNowTicks()) ) 
+            x.AddPerfStatistics( reqID, serviceID, remoteSignature )
+            x.PrimaryQueue.Enqueue( serviceID ) 
+            x.EvPrimaryQueue.Set() |> ignore 
+        else
+            use msError = new MemStream( 1024 ) 
+            health.WriteHeader( msError ) 
+            msError.WriteBytes( serviceID.ToByteArray() )
+            health.WriteEndMark( msError ) 
+            Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "query service ID %s is not supported at this backend" (serviceID.ToString()) ))
+            queue.ToSend( ControllerCommand( ControllerVerb.NonExist, ControllerNoun.QueryReply ), msError )
+    member internal x.AddPerfStatistics( reqID, serviceID, remoteSignature ) = 
+        if x.StatisticsPeriodInSecond >= 0 then 
+            x.StatisticsCollection.GetOrAdd( reqID, ( (PerfADateTime.UtcNowTicks()), serviceID, remoteSignature, ref None )  ) |> ignore
+            x.CleanStatisticsQueue() 
+    member x.CleanStatisticsQueue() = 
+        let ticksCur = (PerfADateTime.UtcNowTicks())
+        let ticksOld = !lastStatisticsQueueCleanRef 
+        let ticksClean = ticksCur - TimeSpan.TicksPerSecond * int64 x.StatisticsPeriodInSecond
+        if ticksCur - ticksOld >= TimeSpan.TicksPerSecond then 
+            if Interlocked.CompareExchange( lastStatisticsQueueCleanRef, ticksCur, ticksOld ) = ticksOld then 
+                // Get the lock for cleaning, avoid frequent cleaning operation
+                let cntRemoved = ref 0
+                let earliestTicks = ref Int64.MaxValue
+                for pair in x.StatisticsCollection do 
+                    let ticks, _, _, _ = pair.Value
+                    if ticks <= ticksClean then 
+                        x.StatisticsCollection.TryRemove( pair.Key ) |> ignore
+                        cntRemoved := !cntRemoved + 1
+                        if !earliestTicks > ticks then 
+                            earliestTicks := ticks
+                if !cntRemoved > 0 then 
+                    Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "Removed %d query as they timed out, earlied time %s" !cntRemoved (VersionToString(DateTime(!earliestTicks))) ))
+
+    /// Processing primary queue once.
+    /// Return: true: we have done something in the loop (need to examine if there is anything to do). 
+    ///         false: there is nothing to do in the loop
+    member internal x.ExaminePrimaryQueueOnce() = 
+        let bAny, serviceID = x.PrimaryQueue.TryDequeue()
+        if bAny then 
+            let bService, serviceQueue = x.SecondaryServiceQueue.TryGetValue( serviceID ) 
+            if bService then 
+                let bServiceCapacity, capacity = x.ServiceCapacity.TryGetValue( serviceID )
+                if bServiceCapacity then 
+                    let bAnyOtherObject = not x.PrimaryQueue.IsEmpty
+                    // Ensure ExamineServiceQueueOnce is executed 
+                    let bReturn = x.ExamineServiceQueueOnce serviceID serviceQueue capacity
+                    bReturn || bAnyOtherObject
+                else
+                    // Logic error 
+                    Logger.LogF( LogLevel.Error, ( fun _ -> sprintf "When ExaminePrimaryQueueOnce, find service ID %A that has a servce capacity object. Something is wrong!!!" 
+                                                               serviceID ))
+                    true
+            else
+                // Service ID doesn't exist, something wrong, as it should not be enqueued in the first place. 
+                Logger.LogF( LogLevel.Error, ( fun _ -> sprintf "When ExaminePrimaryQueueOnce, find service ID %A that doesn't exist in service queue. Something is wrong!!!" 
+                                                           serviceID ))
+
+                true
+        else
+            false    
+    /// Examine a certain service queue once
+    /// If we dequeued the request, we should return true, to reexamine. 
+    ///     We will need to requeue serviceID at the completion of the query, so that waiting query that previously has no slot to be serviced can be examined. 
+    /// If we don't do anything, we will return false (no need to reexamine) 
+    member internal x.ExamineServiceQueueOnce serviceID serviceQueue capacity = 
+        let nItems = Interlocked.Increment( capacity.CurrentItems ) 
+        if nItems > capacity.Capacity then 
+            // Exceed capacity 
+            Interlocked.Decrement( capacity.CurrentItems ) |> ignore
+            // Any queue items that is time out? 
+            x.ExamineForTimeout serviceQueue 
+            false
+        else
+            let refValue = ref Unchecked.defaultof<_>
+            let mutable bFindItem = false
+            let numItemsRef = ref 0 
+            while not bFindItem && not (serviceQueue.IsEmpty) do 
+                let bItem = serviceQueue.TryDequeue( refValue ) 
+                if bItem then 
+                    let reqID, requestObject, remoteSignature, ticks = !refValue
+                    let ticksCur = (PerfDateTime.UtcNowTicks())
+                    if x.TimeOutTicks < Int64.MaxValue && ticks < ticksCur - x.TimeOutTicks then 
+                        x.TimeoutRequest ticks reqID remoteSignature // timeout, do not send to process
+                    else
+                        bFindItem <- true                                                              
+                        numItemsRef := serviceQueue.Count
+            if bFindItem then 
+                let bExist, serviceCollection = x.ServiceCollection.TryGetValue( serviceID )
+                if not bExist then 
+                    Logger.LogF( LogLevel.Error, ( fun _ -> sprintf "When ExamineServiceQueueOnce, service collection of service ID %A doesn't exist. Something is wrong!!!" 
+                                                               serviceID ))
+                    Interlocked.Decrement( capacity.CurrentItems ) |> ignore
+                    false
+                else
+                    let serviceSeq = serviceCollection :> seq<_> 
+                    let serviceInstance = serviceSeq |> Seq.find( fun service -> service.GrabOneInstance() )
+                    if Utils.IsNull serviceInstance then 
+                        Logger.LogF( LogLevel.Error, ( fun _ -> sprintf "When ExamineServiceQueueOnce, can't find service ID %A in the ConcurrentBag of service collection. Something is wrong!!!" 
+                                                                   serviceID ))
+                        Interlocked.Decrement( capacity.CurrentItems ) |> ignore
+                        false
+                    else
+                        let reqID, requestObject, remoteSignature, ticks = !refValue
+                        let ticksCur = (PerfADateTime.UtcNowTicks())
+                        let timeInQueueMS = int (( ticksCur - ticks ) / TimeSpan.TicksPerMillisecond)
+                        let timebudgetInMs = if x.TimeOutTicks = Int64.MaxValue then Int32.MaxValue else int (( x.TimeOutTicks - ( ticksCur - ticks ) ) / TimeSpan.TicksPerMillisecond )
+                        let numSlotsAvailable = capacity.Capacity - (!capacity.CurrentItems)
+                        serviceInstance.ProcessRequest( reqID, requestObject, timebudgetInMs, x.SendReply (!numItemsRef) numSlotsAvailable ticksCur timeInQueueMS reqID remoteSignature, 
+                                                            x.ErrorReply reqID remoteSignature, 
+                                                            x.FinishProcessRequest reqID serviceInstance capacity
+                                                             )
+                        true
+            else
+                Interlocked.Decrement( capacity.CurrentItems ) |> ignore
+                false
+    /// Always called to ensure proper clean up
+    member internal x.FinishProcessRequest reqID serviceInstance capacity () = 
+        serviceInstance.ReleaseOneInstance() 
+        Interlocked.Decrement( capacity.CurrentItems ) |> ignore
+        Interlocked.Increment( capacity.TotalItems ) |> ignore
+        // Trigger re-examine of service
+        x.PrimaryQueue.Enqueue( serviceInstance.ServiceID ) 
+        x.EvPrimaryQueue.Set() |> ignore 
+        Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "Finished req %A serviceInstance %A, capacity %A" 
+                                                                   reqID serviceInstance capacity))
+        ()
+    member internal x.ExamineForTimeout serviceQueue = 
+        if false then 
+            // Skip all this code
+            if x.TimeOutTicks < Int64.MaxValue then 
+                // No timeout examine if x.TimeOutTicks = Int64.MaxValue
+                let mutable bDoneExamine = false
+                while not bDoneExamine do 
+                    bDoneExamine <- true
+                    let bItem, tuple = serviceQueue.TryPeek() 
+                    if bItem then 
+                        let _, _, _, ticks = tuple 
+                        let ticksCur = (PerfDateTime.UtcNowTicks())
+                        if ticks < ticksCur - x.TimeOutTicks then 
+                            // Try remove the item, notice that the item may not be actually timed out due to multithread competition
+                            let bItem, tuple = serviceQueue.TryDequeue() 
+                            if bItem then 
+                                let reqID, requestObject, remoteSignature, ticks = tuple 
+                                if ticks < ticksCur - x.TimeOutTicks then 
+                                    // Timeout 
+                                    x.TimeoutRequest ticks reqID remoteSignature
+                                    // Only when we successfully throw away a timeout item, we will need to reexamine another 
+                                    bDoneExamine <- false
+                                else
+                                    // Reexamine, this put the item in lower priority though. 
+                                    serviceQueue.Enqueue( tuple )
+
+    member internal x.TimeoutRequest ticks reqID remoteSignature =
+        let queue = Cluster.Connects.LookforConnectBySignature( remoteSignature ) 
+        let bHealth, health = x.FrontEndHealth.TryGetValue( remoteSignature )
+        if bHealth && not (Utils.IsNull queue) then 
+            let ticksCur = (PerfADateTime.UtcNowTicks())
+            let elapse = int( ( ticksCur - ticks )/TimeSpan.TicksPerMillisecond ) 
+            use msTimeOut = new MemStream( 1024 ) 
+            health.WriteHeader( msTimeOut ) 
+            msTimeOut.WriteBytes( reqID.ToByteArray() )
+            msTimeOut.WriteInt32( elapse ) // Timeout after (ms) 
+            health.WriteEndMark( msTimeOut ) 
+            Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "query %s times out at the backend after %d ms" (reqID.ToString()) elapse ))
+            queue.ToSend( ControllerCommand( ControllerVerb.TimeOut, ControllerNoun.QueryReply ), msTimeOut )
+            if x.StatisticsPeriodInSecond >=0 then 
+                let bExist, tuple = x.StatisticsCollection.TryGetValue( reqID )
+                let _, _, _, statisticsHolderRef = tuple
+                statisticsHolderRef := Some ( "Timeout", elapse, 0 )
+    member internal x.SendReply capacity numSlotsAvailable ticks timeInQueueMS reqID remoteSignature (replyObject:Object) =
+        let queue = Cluster.Connects.LookforConnectBySignature( remoteSignature ) 
+        let bHealth, health = x.FrontEndHealth.TryGetValue( remoteSignature )
+        if bHealth && not (Utils.IsNull queue) then 
+            let ticksCur = (PerfADateTime.UtcNowTicks())
+            let timeInProcessingMS = int (( ticksCur - ticks ) / TimeSpan.TicksPerMillisecond)
+            let qPerf = SingleRequestPerformance( InQueue = timeInQueueMS, InProcessing = timeInProcessingMS, 
+                                                NumSlotsAvailable = numSlotsAvailable, 
+                                                Capacity = capacity )
+            use msReply = new MemStream( ) 
+            health.WriteHeader( msReply )         
+            msReply.WriteBytes( reqID.ToByteArray() ) 
+            SingleRequestPerformance.Pack( qPerf, msReply )
+            msReply.SerializeObjectWithTypeName( replyObject ) 
+            health.WriteEndMark( msReply ) 
+            Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "query %s has been served and returned with a reply of %dB (%s)" (reqID.ToString()) (msReply.Length) (qPerf.BackEndInfo()) ))
+            queue.ToSend( ControllerCommand( ControllerVerb.Reply, ControllerNoun.QueryReply ), msReply )
+            if x.StatisticsPeriodInSecond >=0 then 
+                let bExist, tuple = x.StatisticsCollection.TryGetValue( reqID )
+                let _, _, _, statisticsHolderRef = tuple
+                statisticsHolderRef := Some ( "Reply", timeInQueueMS, timeInProcessingMS )
+    member internal x.ErrorReply reqID remoteSignature (msg:string) =
+        let queue = Cluster.Connects.LookforConnectBySignature( remoteSignature ) 
+        let bHealth, health = x.FrontEndHealth.TryGetValue( remoteSignature )
+        if bHealth && not (Utils.IsNull queue) then 
+            use msReply = new MemStream( ) 
+            health.WriteHeader( msReply )         
+            msReply.WriteBytes( reqID.ToByteArray() ) 
+            msReply.WriteString( msg ) 
+            health.WriteEndMark( msReply ) 
+            Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "service of query %s lead to error %s" (reqID.ToString()) (msg) ))
+            queue.ToSend( ControllerCommand( ControllerVerb.Error, ControllerNoun.QueryReply ), msReply )
+            if x.StatisticsPeriodInSecond >=0 then 
+                let bExist, tuple = x.StatisticsCollection.TryGetValue( reqID )
+                let ticks, _, _, statisticsHolderRef = tuple
+                let elapse = int( ( (PerfADateTime.UtcNowTicks()) - ticks )/TimeSpan.TicksPerMillisecond ) 
+                statisticsHolderRef := Some ( "Error", elapse, 0 )
+    /// <summary>
+    /// Return frontend-backend connection statistics in the following forms:
+    ///     "backend-frontend", NetworkPerformance 
+    /// </summary>
+    member x.ListActiveFrontEnds() = 
+        x.FrontEndHealth |> Seq.choose( fun pair -> if pair.Value.ConnectionReady() then 
+                                                        Some (RemoteExecutionEnvironment.MachineName + "-" + LocalDNS.GetHostInfoInt64( pair.Key), pair.Value.GetRtt() )
+                                                    else 
+                                                        None )
+    /// <summary> 
+    /// Return query performance in the following forms:
+    ///     frontend server, serviceID, service msg, msInQueue, msInProcessing
+    /// service_msg: null (not served yet).
+    ///              "Timeout", the request is timed out. 
+    ///              "Reply", the request is succesfully served. msInQueue
+    /// </summary>
+    member x.GetRequestStatistics() = 
+        let countRef = ref 0
+        let filterByUnavail = ref 0 
+        x.CleanStatisticsQueue()
+        Logger.LogF( LogLevel.MildVerbose, ( fun _ -> sprintf "GetRequestStatistics called, analyze %d query statistics"
+                                                               x.StatisticsCollection.Count ))
+        x.StatisticsCollection |> Seq.choose( fun pair ->   let ticks, serviceID, remoteSignature, statisticsHolderRef = pair.Value
+                                                            match !statisticsHolderRef with 
+                                                            | None -> 
+                                                                filterByUnavail := !filterByUnavail + 1
+                                                                None 
+                                                            | Some tuple -> 
+                                                                let msg, msInQueue, msInProcessing = tuple
+                                                                Logger.LogF( LogLevel.WildVerbose, ( fun _ -> countRef := ! countRef + 1
+                                                                                                              sprintf "Query %d (unavail:%d), %s, inQueue=%d ms, inProc = %d ms"
+                                                                                                                       !countRef !filterByUnavail
+                                                                                                                       msg 
+                                                                                                                       msInQueue msInProcessing ))
+                                                                Some ( LocalDNS.GetHostInfoInt64( remoteSignature ), RemoteExecutionEnvironment.ContainerName, serviceID, msg, msInQueue, msInProcessing ) )
+
+
+type BackEndInstance<'StartParamType when 'StartParamType :> ServiceEndPointParam > = 
+    ServiceEndPointInstance<'StartParamType>
 
 
 #if UNCOVER_DELETE
@@ -264,7 +734,7 @@ type FormMsgToFrontEndFunction = Func< unit, seq< ControllerCommand * MemStream 
 type BackEndParseFunction = Func< (NetworkCommandQueue * NetworkPerformance * ControllerCommand * StreamBase<byte>),( bool * ManualResetEvent ) >
 
 /// <summary>
-/// This class represent a backend query instance. The developer needs to extend BackEndInstance class, to implement the missing functions.
+/// This class represent a backend query instance. The developer needs to extend ServiceEndPointInstance class, to implement the missing functions.
 /// The following command are reserved:
 ///     List, Buffer : in the beginning, to list Guids that are used by the current backend instance. 
 ///     Read, Buffer : request to send a list of missing Guids. 
@@ -279,7 +749,7 @@ type BackEndParseFunction = Func< (NetworkCommandQueue * NetworkPerformance * Co
 ///     NonExist, QueryReply : requested BackEnd service ID doesn't exist. 
 /// </summary> 
 [<AllowNullLiteral; AbstractClass>]
-type BackEndInstance< 'StartParamType 
+type ServiceEndPointInstance< 'StartParamType 
                     when 'StartParamType :> ServiceEndPointParam >() =
     inherit WorkerRoleInstance<'StartParamType>()
     let mutable dnsResolveIntervalFrontEndInMS = 10000
@@ -325,11 +795,11 @@ type BackEndInstance< 'StartParamType
         else
             bags.Add( serviceInstance )
 
-    /// Programmer will need to extend BackEndInstance class to fill in OnStartBackEnd. The jobs of OnStartBackEnd are: 
+    /// Programmer will need to extend ServiceEndPointInstance class to fill in OnStartBackEnd. The jobs of OnStartBackEnd are: 
     /// 1. fill in ServiceCollection entries. Note that N parallel thread will be running the Run() operation. However, OnStartBackEnd are called only once.  
     /// 2. fill in BufferCache.Current on CacheableBuffer (constant) that we will expect to store at the server side. 
     /// 3. fill in MoreParseFunc, if you need to extend beyond standard message exchanged between BackEnd/FrontEnd
-    ///         Please make sure not to use reserved command (see list in the description of the class BackEndInstance )
+    ///         Please make sure not to use reserved command (see list in the description of the class ServiceEndPointInstance )
     ///         Network health and message integrity check will be enforced. So when you send a new message to the FrontEnd, please use:
     ///             health.WriteHeader (ms)
     ///             ... your own message ...
@@ -393,8 +863,8 @@ type BackEndInstance< 'StartParamType
             initialMsg.Add( ControllerCommand( ControllerVerb.Set, ControllerNoun.QueryReply ), msCollection ) 
             x.InitialMessage <- initialMsg.ToArray()
             // Export backend information
-            ContractStore.ExportSeqFunction( BackEndInstance<_>.ContractNameActiveFrontEnds, x.ListActiveFrontEnds, -1, true )
-            ContractStore.ExportSeqFunction( BackEndInstance<_>.ContractNameRequestStatistics, x.GetRequestStatistics, -1, true )
+            ContractStore.ExportSeqFunction( ServiceEndPointInstance<_>.ContractNameActiveFrontEnds, x.ListActiveFrontEnds, -1, true )
+            ContractStore.ExportSeqFunction( ServiceEndPointInstance<_>.ContractNameRequestStatistics, x.GetRequestStatistics, -1, true )
 
         bSuccess 
     /// An Entry of Front end, if the value is -1, the FrontEnd is resolved once to an addr/port, and being try to connect
@@ -546,7 +1016,7 @@ type BackEndInstance< 'StartParamType
             if not x.bTerminate then 
                 if x.FrontEndNameEntry.IsEmpty && x.FrontEndHealth.IsEmpty then 
                     // If no gateway, terminates. 
-                    Logger.Log( LogLevel.MildVerbose, ("Terminate BackEndInstance as there is no FrontEnd name entry and no active connection"))
+                    Logger.Log( LogLevel.MildVerbose, ("Terminate ServiceEndPointInstance as there is no FrontEnd name entry and no active connection"))
                     x.bTerminate <- true
                 else
                     x.EvPrimaryQueue.Reset() |> ignore 

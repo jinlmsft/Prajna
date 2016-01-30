@@ -243,7 +243,7 @@ type FrontEndServiceParam() =
 
 
 /// <summary>
-/// This class represent a backend query instance. The developer needs to extend BackEndInstance class, to implement the missing functions.
+/// This class represent a backend query instance. The developer needs to extend ServiceEndPointInstance class, to implement the missing functions.
 /// The following command are reserved:
 ///     List, Buffer : in the beginning, to list Guids that are used by the current backend instance. 
 ///     Read, Buffer : request to send a list of missing Guids. 
@@ -404,11 +404,11 @@ type FrontEndInstance< 'StartParamType
     member val internal TimerRequestTimeout = null with get, set
     member val internal TimerClearClientTracking = null with get, set
     member val internal Listener = null with get, set
-    /// Programmer will need to extend BackEndInstance class to fill in OnStartBackEnd. The jobs of OnStartBackEnd are: 
+    /// Programmer will need to extend ServiceEndPointInstance class to fill in OnStartBackEnd. The jobs of OnStartBackEnd are: 
     /// 1. fill in ServiceCollection entries. Note that N parallel thread will be running the Run() operation. However, OnStartBackEnd are called only once.  
     /// 2. fill in BufferCache.Current on CacheableBuffer (constant) that we will expect to store at the server side. 
     /// 3. fill in MoreParseFunc, if you need to extend beyond standard message exchanged between BackEnd/FrontEnd
-    ///         Please make sure not to use reserved command (see list in the description of the class BackEndInstance )
+    ///         Please make sure not to use reserved command (see list in the description of the class ServiceEndPointInstance )
     ///         Network health and message integrity check will be enforced. So when you send a new message to the FrontEnd, please use:
     ///             health.WriteHeader (ms)
     ///             ... your own message ...

@@ -106,17 +106,17 @@ type SamplePredictor( saveImgDir: string ) =
 /// </summary>
 type SampleRecogInstanceFSharp(saveimgdir: string ) as x = 
     /// ToDo: Please fill in your recognizing engine name below
-    inherit VHubBackEndInstance<VHubBackendStartParam>("RecogEngineName")
+    inherit VHubServiceEndPointInstance<VHubBackendStartParam>("RecogEngineName")
     do 
         x.OnStartBackEnd.Add( new BackEndOnStartFunction<VHubBackendStartParam>( x.InitializeRecognizer) )
     let mutable appInfo = Unchecked.defaultof<_>
     let mutable bSuccessInitialized = false
-    /// Programmer will need to extend BackEndInstance class to fill in OnStartBackEnd. The jobs of OnStartBackEnd are: 
+    /// Programmer will need to extend ServiceEndPointInstance class to fill in OnStartBackEnd. The jobs of OnStartBackEnd are: 
     /// 1. fill in ServiceCollection entries. Note that N parallel thread will be running the Run() operation. However, OnStartBackEnd are called only once.  
     /// 2. fill in BufferCache.Current on CacheableBuffer (constant) that we will expect to store at the server side. 
     ///     Both 1. 2 get done when RegisterClassifier
     /// 3. fill in MoreParseFunc, if you need to extend beyond standard message exchanged between BackEnd/FrontEnd
-    ///         Please make sure not to use reserved command (see list in the description of the class BackEndInstance )
+    ///         Please make sure not to use reserved command (see list in the description of the class ServiceEndPointInstance )
     ///         Network health and message integrity check will be enforced. So when you send a new message to the FrontEnd, please use:
     ///             health.WriteHeader (ms)
     ///             ... your own message ...
@@ -285,7 +285,7 @@ let main argv =
                     bTerminateStatistics <- true
                 else
                     let perfDKV0 = DSet<string*float>(Name="NetworkPerf" )
-                    let perfDKV1 = perfDKV0.Import(null, (BackEndInstance<_>.ContractNameActiveFrontEnds))
+                    let perfDKV1 = perfDKV0.Import(null, (ServiceEndPointInstance<_>.ContractNameActiveFrontEnds))
                     let foldFunc (lst:List<_>) (kv) = 
                         let retLst = 
                             if Utils.IsNull lst then 
@@ -311,7 +311,7 @@ let main argv =
                         bTerminateStatistics <- true
                     else
                         let queryDSet0 = DSet<string*Guid*string*int*int>(Name="QueryStatistics" )
-                        let queryDSet1 = queryDSet0.Import(null, (BackEndInstance<_>.ContractNameRequestStatistics))
+                        let queryDSet1 = queryDSet0.Import(null, (ServiceEndPointInstance<_>.ContractNameRequestStatistics))
                         let aggrStatistics = queryDSet1.Fold(BackEndQueryStatistics.FoldQueryStatistics, BackEndQueryStatistics.AggregateQueryStatistics, null)
                         if Utils.IsNotNull aggrStatistics then 
                             aggrStatistics.ShowStatistics()

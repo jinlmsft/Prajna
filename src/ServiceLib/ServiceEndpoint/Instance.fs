@@ -131,7 +131,7 @@ type VHubBackendStartParam(  ) as x =
     do 
         x.EncodeServiceCollectionAction <- EncodeCollectionAction( VHubServiceInstance.EncodeCollections )
 /// <summary>
-/// This class represent a backend query instance. The developer needs to extend BackEndInstance class, to implement the missing functions.
+/// This class represent a backend query instance. The developer needs to extend ServiceEndPointInstance class, to implement the missing functions.
 /// The following command are reserved:
 ///     List, Buffer : in the beginning, to list Guids that are used by the current backend instance. 
 ///     Read, Buffer : request to send a list of missing Guids. 
@@ -144,11 +144,11 @@ type VHubBackendStartParam(  ) as x =
 ///     Reply, QueryReply : BackEnd send in a reply
 ///     TimeOut, QueryReply : BackEnd is too heavily loaded, and is unable to serve the request. 
 ///     NonExist, QueryReply : requested BackEnd service ID doesn't exist. 
-/// Programmer will need to extend BackEndInstance class to fill in OnStartBackEnd. The jobs of OnStartBackEnd are: 
+/// Programmer will need to extend ServiceEndPointInstance class to fill in OnStartBackEnd. The jobs of OnStartBackEnd are: 
 /// 1. fill in ServiceCollection entries. Note that N parallel thread will be running the Run() operation. However, OnStartBackEnd are called only once.  
 /// 2. fill in BufferCache.Current on CacheableBuffer (constant) that we will expect to store at the server side. 
 /// 3. fill in MoreParseFunc, if you need to extend beyond standard message exchanged between BackEnd/FrontEnd
-///         Please make sure not to use reserved command (see list in the description of the class BackEndInstance )
+///         Please make sure not to use reserved command (see list in the description of the class ServiceEndPointInstance )
 ///         Network health and message integrity check will be enforced. So when you send a new message to the FrontEnd, please use:
 ///             health.WriteHeader (ms)
 ///             ... your own message ...
@@ -157,12 +157,12 @@ type VHubBackendStartParam(  ) as x =
 /// 5. Function in EncodeServiceCollectionAction will be called to pack all service collection into a stream to be sent to the front end. 
 /// </summary>
 [<AllowNullLiteral; AbstractClass >]
-type VHubBackEndInstance<'StartParam when 'StartParam :> VHubBackendStartParam >(engineName) as x = 
-    inherit BackEndInstance< 'StartParam >() 
+type VHubServiceEndPointInstance<'StartParam when 'StartParam :> VHubBackendStartParam >(engineName) as x = 
+    inherit ServiceEndPointInstance< 'StartParam >() 
     do 
         x.OnStartBackEnd.Add( new BackEndOnStartFunction<'StartParam>( x.InstallCodec) )
         x.OnInitialMsgToFrontEnd.Add( new FormMsgToFrontEndFunction( x.EncodeAppInfo ) )
-        ContractStore.ExportSeqFunction (VHubBackEndInstance<_>.ContractNameGetServiceCollection, x.GetServiceCollection, -1, true )
+        ContractStore.ExportSeqFunction (VHubServiceEndPointInstance<_>.ContractNameGetServiceCollection, x.GetServiceCollection, -1, true )
     static member val ContractNameGetServiceCollection = "GetServiceCollection" with get
     member x.InstallCodec param = 
         JobDependencies.InstallDeserializer<RecogRequest>( VHubRecogRequestHelper.RecogRequestCodecGuid, VHubRecogRequestHelper.Unpack, "Customized:RecogRequest")
@@ -221,13 +221,13 @@ type VHubBackEndInstance<'StartParam when 'StartParam :> VHubBackendStartParam >
         reply
     /// Helper function to decode generic service 
     static member WrappedServiceFunc<'U,'V>( serviceFunc: 'U -> 'V ) (jobID: Guid, timeBudget: int, req: RecogRequest)= 
-        let input = VHubBackEndInstance<_>.DecodeInput( req.Data )
+        let input = VHubServiceEndPointInstance<_>.DecodeInput( req.Data )
         let output = serviceFunc( input )
-        VHubBackEndInstance<_>.EncodeOutput<'V>( output )
+        VHubServiceEndPointInstance<_>.EncodeOutput<'V>( output )
     /// Helper function to decode generic service 
     static member WrappedServiceFuncAsync<'U,'V>( serviceFunc: 'U -> Task<'V> ) (jobID: Guid, timeBudget: int, req: RecogRequest)= 
-        let input = VHubBackEndInstance<_>.DecodeInput( req.Data )
-        serviceFunc( input ).ContinueWith( fun (outputTask:Task<'V>) -> VHubBackEndInstance<_>.EncodeOutput<'V>( outputTask.Result ) )
+        let input = VHubServiceEndPointInstance<_>.DecodeInput( req.Data )
+        serviceFunc( input ).ContinueWith( fun (outputTask:Task<'V>) -> VHubServiceEndPointInstance<_>.EncodeOutput<'V>( outputTask.Result ) )
 
 
     /// <summary>
@@ -240,7 +240,7 @@ type VHubBackEndInstance<'StartParam when 'StartParam :> VHubBackendStartParam >
     /// </summary>
     member x.RegisterService<'U,'V>( domain, serviceImageName, serviceFunc: 'U -> 'V ) = 
         let serviceInstance = x.RegisterService<'U,'V>( domain, serviceImageName )
-        serviceInstance.ExecutionMode <- VHubExecutionMode.QueryExecutionByFunc (VHubBackEndInstance<_>.WrappedServiceFunc<'U,'V>(serviceFunc))
+        serviceInstance.ExecutionMode <- VHubExecutionMode.QueryExecutionByFunc (VHubServiceEndPointInstance<_>.WrappedServiceFunc<'U,'V>(serviceFunc))
         serviceInstance
     /// <summary>
     /// Register a service, with supported domain, a local filename that contains a sample image, and a recognition interface. 
@@ -252,7 +252,7 @@ type VHubBackEndInstance<'StartParam when 'StartParam :> VHubBackendStartParam >
     /// </summary>
     member x.RegisterServiceAsync<'U,'V>( domain, serviceImageName, serviceFunc: 'U -> Task<'V> ) = 
         let serviceInstance = x.RegisterService<'U,'V>( domain, serviceImageName )
-        serviceInstance.ExecutionMode <- VHubExecutionMode.QueryByTask (VHubBackEndInstance<_>.WrappedServiceFuncAsync<'U,'V>(serviceFunc))
+        serviceInstance.ExecutionMode <- VHubExecutionMode.QueryByTask (VHubServiceEndPointInstance<_>.WrappedServiceFuncAsync<'U,'V>(serviceFunc))
         serviceInstance
 
 
