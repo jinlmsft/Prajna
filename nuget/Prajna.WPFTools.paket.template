@@ -1,0 +1,41 @@
+type file
+id Prajna.WPFTools
+owners
+    MSRCCS
+authors 
+    MSRCCS
+projectUrl
+    http://github.com/MSRCCS/Prajna
+iconUrl
+    https://raw.githubusercontent.com/MSRCCS/Prajna/master/docs/files/img/logo.png
+licenseUrl
+    http://github.com/MSRCCS/Prajna/blob/master/LICENSE.txt
+requireLicenseAcceptance
+    false
+copyright
+    Copyright 2015
+tags
+    Prajna.WPFTools
+summary
+    Prajna WPFTools
+description
+    Prajna WPFTools
+files
+    ../src/tools/WPFtools/bin/Releasex64/Prajna.WPFTools.dll ==> lib/net45
+    ../src/tools/WPFtools/bin/Releasex64/Prajna.WPFTools.pdb ==> lib/net45
+    ../src/tools/WPFtools/bin/Releasex64/Prajna.WPFTools.xml ==> lib/net45
+references
+    Prajna.WPFTools.dll
+frameworkAssemblies
+    PresentationCore
+    PresentationFramework
+    System
+    System.Core
+    System.Numerics    
+    System.Xaml
+    UIAutomationProvider
+    UIAutomationTypes
+    WindowsBase
+dependencies
+    FSharp.Core >= 3.1.2
+    Prajna    
